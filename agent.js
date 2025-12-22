@@ -632,7 +632,7 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
   const maxRetries = Math.max(1, config.maxRetries || 1);
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const { options: optionOverrides, ...restOverrides } = overrides;
+      const { options: optionOverrides, silent, ...restOverrides } = overrides;
       const body = {
         model: config.model,
         messages,
@@ -648,16 +648,19 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
         ...restOverrides,
       };
 
-      // Log what we're sending to the LLM
-      toLLMLog('[toLLM] ─── Prompt ───');
-      for (const message of messages) {
-        const content = typeof message.content === 'string'
-          ? message.content
-          : JSON.stringify(message.content);
-        toLLMLog(`  [${message.role}] ${content}`);
-      }
-      if (tools?.length) {
-        toLLMLog(`  [tools] ${tools.map(t => t.function?.name || t.name).join(', ')}`);
+      // Log what we're sending to the LLM (unless silent)
+      if (!silent) {
+        toLLMLog('[toLLM] ─── Prompt ───');
+        for (const message of messages) {
+          const content = typeof message.content === 'string'
+            ? message.content
+            : JSON.stringify(message.content);
+          toLLMLog(`  [${message.role}] ${content}`);
+        }
+        if (tools?.length) {
+          const toolNames = tools.map(t => t.function?.name || t.name);
+          toLLMLog(`  [tools] ${toolNames.join(', ')}`);
+        }
       }
 
       const fetchOptions = {
@@ -679,7 +682,31 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
           `Ollama call failed with status ${response.status}: ${text}`,
         );
       }
-      return response.json();
+      const result = await response.json();
+
+      // Log the LLM response (unless silent)
+      if (!silent) {
+        fromLLMLog('[fromLLM] ─── Response ───');
+        const message = result.message;
+        if (message) {
+          const content = extractAssistantText(message);
+          if (content) {
+            fromLLMLog(`  [content] ${content}`);
+          }
+          if (message.tool_calls?.length) {
+            fromLLMLog(`  [tool_calls] ${message.tool_calls.length} call(s):`);
+            for (const call of message.tool_calls) {
+              const arguments_ = call.function?.arguments;
+              const argumentsString = arguments_ && Object.keys(arguments_).length > 0
+                ? JSON.stringify(arguments_)
+                : '{}';
+              fromLLMLog(`    - ${call.function?.name}(${argumentsString})`);
+            }
+          }
+        }
+      }
+
+      return result;
     } catch (error) {
       // Don't retry on abort
       if (error.name === 'AbortError') {
@@ -697,44 +724,48 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
   }
 }
 
+// Field descriptions for generateAgentPrompts (defined once, used in schema and prompt)
+const AGENT_PROMPT_FIELDS = {
+  role_for_user: 'A 1-2 sentence summary of what job you can do with the tools available. Gives context in initial prompt to [user]',
+  role_for_assistant: 'A 1-2 sentence summary of what job you can do with the tools available. Gives context to [assistant] when picking tools, executing each tool, and summarizing results',
+};
+
 /**
  * Generate dynamic agent prompts based on available tools.
- * Returns { role, planningPrompt, iterationPrompt }
+ * Returns { role_for_user, role_for_assistant }
  */
 async function generateAgentPrompts(toolInventory) {
   const responseSchema = {
     type: 'object',
     properties: {
-      role: {
+      role_for_user: {
         type: 'string',
-        description: 'A 1 sentence description of what job you can do. After this we will prompt the user to make a query.',
+        description: AGENT_PROMPT_FIELDS.role_for_user,
       },
-      planningPrompt: {
+      role_for_assistant: {
         type: 'string',
-        description: 'A 1 sentence mission description for tool planning. Will precede tool picking instructions.',
-      },
-      iterationPrompt: {
-        type: 'string',
-        description: 'A 1 sentence mission description for each tool step. Will precede tool execution instructions.',
+        description: AGENT_PROMPT_FIELDS.role_for_assistant,
       },
     },
-    required: ['role', 'planningPrompt', 'iterationPrompt'],
+    required: ['role_for_user', 'role_for_assistant'],
   };
 
   // Pass ALL tools via tools parameter - LLM sees full schemas
-  const allTools = toolInventory.map((t) => t.openAi);
+  // Sort by tier (1 first, then 2, then others)
+  const allTools = toolInventory
+    .toSorted((a, b) => (a.tier ?? 2) - (b.tier ?? 2))
+    .map((t) => t.openAi);
 
   const response = await callOllama(
     [
       {
         role: 'user',
         content: `You are a helpful assistant specializing with the attached tools.
-Please respond with your role, planningPrompt, and iterationPrompt:
+Please respond with your role_for_user and role_for_assistant:
 
 {
-  "role": "A 1 sentence description of what job you can do. After this we will prompt the user to make a query.",
-  "planningPrompt": "A 1 sentence mission description for tool planning. Will precede tool picking instructions.",
-  "iterationPrompt": "A 1 sentence mission description for each tool step. Will precede tool execution instructions."
+  "role_for_user": "${AGENT_PROMPT_FIELDS.role_for_user}",
+  "role_for_assistant": "${AGENT_PROMPT_FIELDS.role_for_assistant}"
 }`,
       },
     ],
@@ -772,15 +803,6 @@ function buildOrderedToolCatalog(prompt, toolInventory) {
 
 function formatToolCatalogForPlanning(catalog) {
   return catalog.map((entry) => entry.name).join(', ');
-}
-
-function formatPlanningPrompt(messages) {
-  return messages
-    .map(
-      (message, index) =>
-        `--- message ${index + 1} (${message.role}) ---\n${message.content}`,
-    )
-    .join('\n');
 }
 
 function parsePlannedToolsResponse(text, toolInventory) {
@@ -957,6 +979,7 @@ async function runPlanningQuery(planningMessages, toolInventory, temperature = 0
       {
         format: { type: 'array', items: { type: 'string' } },
         options: { temperature },
+        silent: true, // Prompt logged once before parallel queries
       },
     );
     clearTimeout(timeoutId);
@@ -1008,7 +1031,7 @@ async function planToolSequence(userPrompt, toolInventory, historySummary = '', 
   const catalogText = formatToolCatalogForPlanning(limitedCatalog);
   const historySection = historySummary ? `History:\n${historySummary}\n\n` : '';
   // Combine mission context (from Intro) + tool selection rules
-  const combinedPlanningPrompt = `${agentPrompts.planningPrompt}\n\n${PLANNING_SYSTEM_PROMPT}`;
+  const combinedPlanningPrompt = `${agentPrompts.role_for_assistant}\n\n${PLANNING_SYSTEM_PROMPT}`;
   const planningMessages = [
     {
       role: 'system',
@@ -1019,9 +1042,13 @@ async function planToolSequence(userPrompt, toolInventory, historySummary = '', 
       content: `${historySection}Request: ${userPrompt}\n\nTOOL LIST: ${catalogText}`,
     },
   ];
-  agentLog(
-    '[agent] Planning prompt:\n' + formatPlanningPrompt(planningMessages),
-  );
+
+  // Log the planning prompt once (before parallel queries)
+  toLLMLog('[toLLM] ─── Planning Prompt ───');
+  for (const message of planningMessages) {
+    toLLMLog(`  [${message.role}] ${message.content}`);
+  }
+
   try {
     // Run 3 planning queries in parallel with varied temperatures
     // Default is 0.8; we vary around it (0.5 = focused, 0.8 = default, 1.1 = creative)
@@ -1902,7 +1929,7 @@ async function runSequentialToolExecution(
   agentPrompts,
 ) {
   // Combine mission context (from Intro) + tool calling rules
-  const combinedIterationPrompt = `${agentPrompts.iterationPrompt}\n\n${SINGLE_TOOL_SYSTEM_PROMPT}`;
+  const combinedIterationPrompt = `${agentPrompts.role_for_assistant}\n\n${SINGLE_TOOL_SYSTEM_PROMPT}`;
   const toolEvents = [];
   let previousResult;
 
@@ -1969,19 +1996,6 @@ async function runSequentialToolExecution(
     }
 
     toToolLog(toolName, Object.keys(arguments_).length > 0 ? JSON.stringify(arguments_) : '(no args)');
-
-    // Confirm before executing
-    say('Proceed?');
-    const confirmed = await confirmToolExecution(toolName, arguments_);
-    if (!confirmed) {
-      toHumanWarn(`[toHuman] Tool ${toolName} skipped by user.`);
-      toolEvents.push({
-        name: toolName,
-        success: false,
-        summary: 'skipped by user',
-      });
-      continue;
-    }
 
     try {
       const result = await client.callTool(
@@ -2125,24 +2139,6 @@ async function runAgentLoop(
       const arguments_ = normalizeArgumentsForEntry(toolEntry, rawArguments);
       toToolLog(name, Object.keys(arguments_).length > 0 ? JSON.stringify(arguments_) : '(no args)');
 
-      // Confirm before executing
-      say('Proceed?');
-      const confirmed = await confirmToolExecution(name, arguments_);
-      if (!confirmed) {
-        toHumanWarn(`[toHuman] Tool ${name} skipped by user.`);
-        toolEvents.push({
-          name,
-          success: false,
-          summary: 'skipped by user',
-        });
-        conversation.push({
-          role: 'tool',
-          tool_name: name,
-          content: 'Tool execution skipped by user.',
-        });
-        continue;
-      }
-
       try {
         const result = await client.callTool(
           { name, arguments: arguments_ },
@@ -2278,8 +2274,8 @@ async function main() {
 
   // Show and speak the agent's role
   blankLine();
-  assistantLog(agentPrompts.role);
-  say(agentPrompts.role);
+  assistantLog(agentPrompts.role_for_user);
+  say(agentPrompts.role_for_user);
   blankLine();
   agentLog(
     '[agent] Type or speak a prompt (or "exit" to quit).',
@@ -2370,7 +2366,7 @@ async function main() {
 
         // Final summary call - include mission context from Intro
         const summaryPrompt = buildSummaryPrompt(trimmedInput, toolEvents);
-        const summarySystemPrompt = `${agentPrompts.iterationPrompt}\n\nSummarize what was accomplished based on the tool results.`;
+        const summarySystemPrompt = `${agentPrompts.role_for_assistant}\n\nSummarize what was accomplished based on the tool results.`;
         const summaryResponse = await callOllama(
           [
             { role: 'system', content: summarySystemPrompt },
