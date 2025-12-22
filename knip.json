@@ -1,0 +1,7 @@
+{
+  "$schema": "https://unpkg.com/knip@latest/schema.json",
+  "entry": ["agent.js"],
+  "project": ["**/*.{js,ts}"],
+  "ignore": ["node_modules/**"],
+  "ignoreDependencies": ["hear-say"]
+}
