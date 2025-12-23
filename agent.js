@@ -22,48 +22,26 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { say, hear } from 'hear-say';
 
-let stemmerFunction;
-try {
-  const stemmerModule = await import('stemmer');
-  stemmerFunction =
-    stemmerModule?.default ??
-    stemmerModule?.stemmer ??
-    stemmerModule?.Stemmer ??
-    undefined;
-} catch {
-  stemmerFunction = undefined;
-}
-const stemmer =
-  typeof stemmerFunction === 'function'
-    ? stemmerFunction
-    : (token) => String(token ?? '').toLowerCase();
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DEFAULT_SYSTEM_PROMPT = `You are a tool-using assistant.  Do not guess or fabricate tool output.`;
 const MAX_SEQUENTIAL_PLAN_LENGTH = 6;
-const PLANNING_SYSTEM_PROMPT = `Read user's request message and pick the smallest tool sequence (1-${MAX_SEQUENTIAL_PLAN_LENGTH}) from TOOL LIST to match the request. Follow these RULES:
-1. Use only tools the user requested.
-2. Use exact tool names from TOOL LIST - NO invented names.
-3. Use tool names in the EXACT SAME ORDER as in the user's request
-4. Do NOT add extra tools.
-5. If one tool solves it, return only that tool only.
+const PLANNING_SYSTEM_PROMPT = `Select tools from TOOLS to fulfill the user request.
 
-OUTPUT: ["tool_name"] or ["first_tool", "second_tool", ...]`;
+RULES:
+1. Map user intent to tools (e.g., "go to X" → transfer tools, "fix orbit" → circularize).
+2. Pick the smallest set of tools needed.
+3. Use exact tool names - NO invented names.
+4. Return tools in execution order.
+5. Return empty array ONLY for greetings or questions.
+6. Do not repeat tools from HISTORY for the same purpose.`;
 
-const SINGLE_TOOL_SYSTEM_PROMPT = `You are a tool-calling assistant. You MUST call the provided tool for this step. Extract argument values from the user's request. Prefer default/empty arguments unless requested otherwise.  Do not imagine argument values.  Do not explain - just call the tool with the correct arguments.`;
+const SINGLE_TOOL_RULES = `RULES:
+1. You MUST call the provided tool for this step.
+2. Extract argument values from the user's request.
+3. Prefer empty arguments unless the user specifies arguments.
+4. Do not make up argument values.`;
 
-const TOOL_PRIMER_LIMIT = 12;
-const TOOL_DESCRIPTION_MAX = 127;
-const MAX_TOOL_REMINDERS = 2;
-const PLANNING_CATALOG_LIMIT = 6;
-const TOOL_REMINDER_PROMPT =
-  'Reminder: when a tool is needed, reply with an assistant message that has empty content and only the tool_calls entry.';
-const INCOMPLETE_RESPONSE_PROMPT =
-  'Reminder: your previous reply did not answer the request. Continue the task and invoke tools as needed until the request is satisfied.';
-const MAX_TOOLS_PER_CALL = 12;
-const MIN_TOOLS_PER_CALL = 1;
 const HISTORY_MAX_PROMPTS = 5;
 const HISTORY_PROMPT_TEXT_LIMIT = 140;
 const HISTORY_RESULT_TEXT_LIMIT = 160;
@@ -267,7 +245,6 @@ const {
   values: {
     model,
     ollamaUrl,
-    systemPrompt,
     transport,
     mcpBin,
     mcpHttpUrl,
@@ -285,10 +262,6 @@ const {
     ollamaUrl: {
       type: 'string',
       default: process.env.OLLAMA_URL ?? 'http://localhost:11434',
-    },
-    systemPrompt: {
-      type: 'string',
-      default: process.env.SYSTEM_PROMPT ?? DEFAULT_SYSTEM_PROMPT,
     },
     transport: {
       type: 'string',
@@ -342,7 +315,6 @@ function parsePositiveInt(value, defaultValue) {
 const config = {
   model,
   ollamaUrl,
-  systemPrompt,
   transport: transport.toLowerCase(),
   mcpBin: resolveMcpBin(mcpBin),
   mcpHttpUrl,
@@ -358,12 +330,6 @@ if (!['stdio', 'http'].includes(config.transport)) {
   );
   process.exit(1);
 }
-
-// Core tools that are always included in tool selection (configurable via --coreTools)
-const ALWAYS_INCLUDE_TOOLS = config.coreTools
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
 
 /**
  * Connect to the MCP server (stdio or HTTP) and return the loaded tool schemas.
@@ -406,7 +372,27 @@ async function connectToMcp() {
   await client.connect(transportInstance);
   const { tools } = await client.listTools({});
   const toolInventory = convertToolsForOllama(tools);
-  const toolPrimerMessage = buildToolPrimer(tools);
+
+  // List resources
+  let resourceInventory = [];
+  try {
+    const { resources } = await client.listResources({});
+    resourceInventory = resources || [];
+    agentLog(`[agent] Loaded ${resourceInventory.length} MCP resources.`);
+  } catch {
+    agentWarn('[agent] Failed to list resources (server may not support them).');
+  }
+
+  // List prompts
+  let promptInventory = [];
+  try {
+    const { prompts } = await client.listPrompts({});
+    promptInventory = prompts || [];
+    agentLog(`[agent] Loaded ${promptInventory.length} MCP prompts.`);
+  } catch {
+    agentWarn('[agent] Failed to list prompts (server may not support them).');
+  }
+
   agentLog(
     `[agent] Loaded ${tools.length} MCP tools and exposed them to Ollama.`,
   );
@@ -414,8 +400,9 @@ async function connectToMcp() {
   return {
     client,
     toolInventory,
+    resourceInventory,
+    promptInventory,
     transport: transportInstance,
-    toolPrimerMessage,
   };
 }
 
@@ -439,7 +426,7 @@ function buildStdioCommand() {
 }
 
 function convertToolsForOllama(tools) {
-  const initialEntries = tools.map((tool) => {
+  return tools.map((tool) => {
     const openAiTool = {
       type: 'function',
       function: {
@@ -458,163 +445,132 @@ function convertToolsForOllama(tools) {
     const parameterKeys = Object.keys(
       openAiTool.function.parameters?.properties ?? {},
     );
-    const parameterNames = parameterKeys.join(' ');
-    const descriptionTokens = tokenizeText(
-      openAiTool.function.description ?? '',
-    );
-    const parameterTokens = parameterKeys.flatMap((key) => tokenizeText(key));
-    const nameTokens = generateSearchTokens(openAiTool.function.name);
-    const combinedTokens = new Set([
-      ...nameTokens,
-      ...descriptionTokens,
-      ...parameterTokens,
-    ]);
-    const searchTokens = [...combinedTokens];
-    const stemTokens = [...new Set(searchTokens.map((token) => stemToken(token)).filter(Boolean))];
-    const searchText = [
-      ...searchTokens,
-      openAiTool.function.description ?? '',
-      parameterNames,
-    ]
-      .join(' ')
-      .toLowerCase();
-    const nameFragments = generateNameFragments(openAiTool.function.name);
 
     return {
       openAi: openAiTool,
-      searchText,
       parameterKeys,
-      searchTokens,
-      searchTokenSet: new Set(searchTokens),
-      stemTokens,
-      stemTokenSet: new Set(stemTokens),
-      nameFragments,
-      recommendedTools: [],
-      // MCP metadata
       tier: tool._meta?.tier ?? 2,
       annotations: tool.annotations ?? {},
       isReadOnly: tool.annotations?.readOnlyHint ?? false,
       isDestructive: tool.annotations?.destructiveHint ?? false,
     };
   });
+}
 
-  const descriptions = tools.map((tool) => tool.description ?? '');
-  for (const [index, entry] of initialEntries.entries()) {
-    const description = descriptions[index].toLowerCase();
-    const collapsedDesc = description.replaceAll(/[\s_-]/g, '');
-    const references = [];
-    for (const [candidateIndex, candidate] of initialEntries.entries()) {
-      if (candidateIndex === index) {
-        continue;
-      }
-      if (
-        candidate.searchTokens.some((token) => {
-          const collapsedToken = token.replaceAll(/[\s_-]/g, '');
-          return (
-            description.includes(token) ||
-            collapsedDesc.includes(collapsedToken)
-          );
-        })
-      ) {
-        references.push(candidate.openAi.function.name);
-      }
+/**
+ * Read a resource and parse JSON if applicable.
+ * Returns parsed data or raw text, undefined on error.
+ */
+async function readResource(client, uri) {
+  try {
+    const result = await client.readResource({ uri });
+    const content = result.contents?.[0];
+    if (!content) return;
+
+    // Parse JSON if mime type indicates
+    if (content.mimeType === 'application/json') {
+      return JSON.parse(content.text);
     }
-    entry.recommendedTools = references;
+    return content.text;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    agentWarn(`[agent] Failed to read resource ${uri}: ${message}`);
+    return;
   }
-
-  return initialEntries;
 }
 
-function generateSearchTokens(name) {
-  if (!name) {
-    return [];
+/**
+ * Format status resource data for display.
+ * Domain-agnostic: handles pre-formatted strings or structured objects.
+ */
+function formatStatusResource(status) {
+  if (!status) return '';
+
+  // If it has an error, return empty
+  if (typeof status === 'object' && status.error) return '';
+
+  // If it's already a string, use it directly (MCP service pre-formatted it)
+  if (typeof status === 'string') {
+    return status.trim();
   }
-  const variants = new Set();
-  const lower = name.toLowerCase();
-  variants.add(lower);
-  variants.add(
-    name
-      .replaceAll(/([a-z0-9])([A-Z])/g, '$1 $2')
-      .replaceAll(/[_-]+/g, ' ')
-      .toLowerCase(),
-  );
-  variants.add(lower.replaceAll(/[_-]+/g, ' '));
-  variants.add(lower.replaceAll(/[\s_-]+/g, ''));
-  const tokens = new Set();
-  for (const value of variants) {
-    for (const token of tokenizeText(value)) tokens.add(token);
+
+  // If object has a formatted/summary field, use that
+  if (status.formatted) return String(status.formatted).trim();
+  if (status.summary) return String(status.summary).trim();
+
+  // Otherwise, create simple key-value summary of top-level fields
+  const parts = [];
+  for (const [key, value] of Object.entries(status)) {
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'object') {
+      // For objects/arrays, just show count or type
+      if (Array.isArray(value)) {
+        if (value.length > 0) parts.push(`${key}: ${value.length} items`);
+      } else {
+        parts.push(`${key}: {...}`);
+      }
+    } else {
+      // For primitives, show the value
+      parts.push(`${key}: ${value}`);
+    }
   }
-  return [...tokens];
+  return parts.join(', ');
 }
 
-function generateNameFragments(name) {
-  if (!name) {
-    return [];
-  }
-  const spaced = name
-    .replaceAll(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replaceAll(/[_-]+/g, ' ');
-  return tokenizeText(spaced);
+/**
+ * Format prompt inventory for LLM matching.
+ * Returns text list of available prompts with descriptions.
+ */
+function formatPromptsForMatching(promptInventory) {
+  if (!promptInventory?.length) return '';
+  return promptInventory.map(p => {
+    const parameterList = p.arguments?.map(a => `${a.name}${a.required ? '' : '?'}`).join(', ') || '';
+    return `- ${p.name}(${parameterList}): ${p.description || 'No description'}`;
+  }).join('\n');
 }
 
-// Common stop words to filter out during keyword extraction
-const STOP_WORDS = new Set([
-  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was',
-  'one', 'our', 'out', 'has', 'have', 'been', 'were', 'they', 'this', 'that',
-  'with', 'from', 'will', 'would', 'there', 'their', 'what', 'about', 'which',
-  'when', 'make', 'like', 'just', 'over', 'such', 'into', 'than', 'then', 'them',
-  'these', 'some', 'could', 'other', 'very', 'after', 'most', 'also', 'made',
-  'please', 'want', 'need', 'help', 'using', 'use', 'run', 'let', 'now', 'how',
-  'plan', 'create', 'setup', 'first', 'next', 'before', 'should', 'show', 'tell',
-  'current', 'give', 'report', 'check', 'get', 'find', 'look', 'see', 'call',
-]);
-
-function tokenizeText(text) {
-  if (!text) {
-    return [];
-  }
-  const matches = text.toLowerCase().match(/[a-z0-9]{3,}/g);
-  const filtered = (matches ?? []).filter((word) => !STOP_WORDS.has(word));
-  return [...new Set(filtered)];
-}
-
-function stemToken(token) {
-  if (!token) {
-    return '';
-  }
-  return stemmer(String(token)).toLowerCase();
-}
-
-function buildToolPrimer(tools) {
-  if (tools.length === 0) {
-    return '';
+/**
+ * Match user intent to available prompts using LLM.
+ * Returns { matched: true, prompt: string, args: object } or { matched: false }
+ */
+async function matchPromptToIntent(userRequest, promptInventory, agentPrompts) {
+  if (!promptInventory?.length) {
+    return { matched: false };
   }
 
-  const lines = [];
-  const limitedTools = tools.slice(0, TOOL_PRIMER_LIMIT);
-  for (const tool of limitedTools) {
-    const raw = (tool.description ?? 'No description provided.')
-      .replaceAll(/\s+/g, ' ')
-      .trim();
-    const truncated =
-      raw.length > TOOL_DESCRIPTION_MAX
-        ? `${raw.slice(0, TOOL_DESCRIPTION_MAX - 3)}...`
-        : raw;
-    lines.push(`- ${tool.name}: ${truncated}`);
+  const promptList = formatPromptsForMatching(promptInventory);
+
+  const matchPrompt = `WORKFLOW TEMPLATES:
+${promptList}
+
+USER REQUEST:
+${userRequest}
+
+OUTPUT: If a workflow template matches the user's intent, return JSON:
+{"matched": true, "prompt": "template-name", "args": {"arg1": "value1"}}
+
+If no template matches, return:
+{"matched": false}`;
+
+  try {
+    const response = await callOllama(
+      [
+        { role: 'system', content: agentPrompts.role_for_assistant },
+        { role: 'user', content: matchPrompt },
+      ],
+      [],
+      { options: { temperature: 0.3 }, silent: true },
+    );
+
+    const text = extractAssistantText(response.message).trim();
+    const result = JSON.parse(text);
+    if (result.matched && result.prompt) {
+      return { matched: true, prompt: result.prompt, args: result.args || {} };
+    }
+  } catch {
+    // Parse failed or LLM error, no match
   }
-
-  const remaining = tools.length - limitedTools.length;
-  const extraLine =
-    remaining > 0 ? `- ...plus ${remaining} more tool(s).` : '';
-
-  return [
-    `Tools available (${tools.length}).`,
-    'Pick the best match, call it, and wait for the result. Do not invent tool names.',
-    ...lines,
-    extraLine,
-  ]
-    .filter(Boolean)
-    .join('\n');
+  return { matched: false };
 }
 
 /**
@@ -655,11 +611,13 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
           const content = typeof message.content === 'string'
             ? message.content
             : JSON.stringify(message.content);
-          toLLMLog(`  [${message.role}] ${content}`);
+          toLLMLog(`[${message.role}]`);
+          toLLMLog(content);
+          blankLine();
         }
         if (tools?.length) {
           const toolNames = tools.map(t => t.function?.name || t.name);
-          toLLMLog(`  [tools] ${toolNames.join(', ')}`);
+          toLLMLog(`[tools] ${toolNames.join(', ')}`);
         }
       }
 
@@ -691,16 +649,16 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
         if (message) {
           const content = extractAssistantText(message);
           if (content) {
-            fromLLMLog(`  [content] ${content}`);
+            fromLLMLog(`[content] ${content}`);
           }
           if (message.tool_calls?.length) {
-            fromLLMLog(`  [tool_calls] ${message.tool_calls.length} call(s):`);
+            fromLLMLog(`[tool_calls] ${message.tool_calls.length} call(s):`);
             for (const call of message.tool_calls) {
               const arguments_ = call.function?.arguments;
               const argumentsString = arguments_ && Object.keys(arguments_).length > 0
                 ? JSON.stringify(arguments_)
                 : '{}';
-              fromLLMLog(`    - ${call.function?.name}(${argumentsString})`);
+              fromLLMLog(`  ${call.function?.name}(${argumentsString})`);
             }
           }
         }
@@ -726,15 +684,15 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
 
 // Field descriptions for generateAgentPrompts (defined once, used in schema and prompt)
 const AGENT_PROMPT_FIELDS = {
-  role_for_user: 'A 1-2 sentence summary of what job you can do with the tools available. Gives context in initial prompt to [user]',
-  role_for_assistant: 'A 1-2 sentence summary of what job you can do with the tools available. Gives context to [assistant] when picking tools, executing each tool, and summarizing results',
+  role_for_user: 'A 1-2 sentence greeting describing what you (the assistant) can help with. Written in first person (I can help you...).',
+  role_for_assistant: 'A 1-2 sentence mission statement for yourself when selecting and executing tools. Written in first person (I help the user...).',
 };
 
 /**
  * Generate dynamic agent prompts based on available tools.
  * Returns { role_for_user, role_for_assistant }
  */
-async function generateAgentPrompts(toolInventory) {
+async function generateAgentPrompts(toolInventory, client) {
   const responseSchema = {
     type: 'object',
     properties: {
@@ -750,26 +708,52 @@ async function generateAgentPrompts(toolInventory) {
     required: ['role_for_user', 'role_for_assistant'],
   };
 
-  // Pass ALL tools via tools parameter - LLM sees full schemas
-  // Sort by tier (1 first, then 2, then others)
-  const allTools = toolInventory
-    .toSorted((a, b) => (a.tier ?? 2) - (b.tier ?? 2))
-    .map((t) => t.openAi);
+  // Build a text summary of tools for the prompt (don't pass as callable tools)
+  // Tier 1 & 2 get name + description, others just names
+  const toolSummary = formatToolsByTier(toolInventory);
+
+  // Try to get status context from ksp://status resource
+  let statusInfo = '';
+  if (client) {
+    agentLog('[agent] Reading ksp://status resource for intro context...');
+    const statusData = await readResource(client, 'ksp://status');
+    if (statusData) {
+      if (statusData.error) {
+        agentLog(`[agent] Intro status error: ${statusData.error}`);
+      } else {
+        statusInfo = formatStatusResource(statusData);
+        if (statusInfo) {
+          agentLog(`[agent] Status: ${truncateText(statusInfo, 100)}`);
+        } else {
+          agentLog('[agent] Intro status: formatStatusResource returned empty');
+        }
+      }
+    } else {
+      agentLog('[agent] Intro status: readResource returned nothing');
+    }
+  }
+
+  const statusContext = statusInfo
+    ? `\nCurrent status from tools:\n${statusInfo}\n`
+    : '';
 
   const response = await callOllama(
     [
       {
         role: 'user',
-        content: `You are a helpful assistant specializing with the attached tools.
-Please respond with your role_for_user and role_for_assistant:
+        content: `You are a helpful assistant with access to these tools:
+
+${toolSummary}
+${statusContext}
+Based on these tools and status, write two 1-2 sentence summary of yourself in these forms:
 
 {
-  "role_for_user": "${AGENT_PROMPT_FIELDS.role_for_user}",
-  "role_for_assistant": "${AGENT_PROMPT_FIELDS.role_for_assistant}"
+  "role_for_user": "I can help [describe what you can accomplish with these TOOLS considering STATUS]...",
+  "role_for_assistant": "You are a helpful assistant specializing in [describe what you can accomplish with these tools]..."
 }`,
       },
     ],
-    allTools,
+    [], // No tools - we just want a JSON response
     { format: responseSchema },
   );
 
@@ -781,33 +765,67 @@ Please respond with your role_for_user and role_for_assistant:
   return JSON.parse(text);
 }
 
-function buildOrderedToolCatalog(prompt, toolInventory) {
-  const keywordInfo = buildKeywordInfo(prompt ?? '');
-  agentLog(`[agent] Keywords extracted: ${keywordInfo.tokens.join(', ')}`);
-  const scored = toolInventory.map((entry) => ({
-    name: entry.openAi.function.name,
-    description: entry.openAi.function.description ?? 'MCP tool',
-    score: scoreToolEntry(entry, keywordInfo),
-  }));
-  scored.sort((a, b) => {
-    if (b.score !== a.score) {
-      return b.score - a.score;
+/**
+ * Get tier 1 and 2 tools (common tools for planning).
+ */
+function getCommonTools(toolInventory) {
+  return toolInventory.filter((t) => (t.tier ?? 2) <= 2);
+}
+
+/**
+ * Get tier 3+ tools (specialized tools).
+ */
+function getOtherTools(toolInventory) {
+  return toolInventory.filter((t) => (t.tier ?? 2) > 2);
+}
+
+/**
+ * Format common tools (tier 1+2) for planning prompts.
+ */
+function formatCommonTools(toolInventory) {
+  const commonTools = getCommonTools(toolInventory);
+  return commonTools
+    .map((t) => `- ${t.openAi.function.name}: ${t.openAi.function.description || 'No description'}`)
+    .join('\n');
+}
+
+/**
+ * Format tool list by tier - tier 1&2 get descriptions, others just names.
+ */
+function formatToolsByTier(toolInventory) {
+  const tier1and2 = toolInventory.filter((t) => (t.tier ?? 2) <= 2);
+  const otherTools = toolInventory.filter((t) => (t.tier ?? 2) > 2);
+
+  const lines = [];
+
+  if (tier1and2.length > 0) {
+    for (const t of tier1and2) {
+      lines.push(`- ${t.openAi.function.name}: ${t.openAi.function.description || 'No description'}`);
     }
-    return a.name.localeCompare(b.name);
-  });
-  // Log top 5 scores for debugging
-  const topScores = scored.slice(0, 5).map((t) => `${t.name}(${t.score})`).join(', ');
-  agentLog(`[agent] Top tool scores: ${topScores}`);
-  return scored;
+  }
+
+  if (otherTools.length > 0) {
+    const otherNames = otherTools.map((t) => t.openAi.function.name).join(', ');
+    lines.push(`- Other tools: ${otherNames}`);
+  }
+
+  return lines.join('\n');
 }
 
-function formatToolCatalogForPlanning(catalog) {
-  return catalog.map((entry) => entry.name).join(', ');
-}
-
+/**
+ * Parse LLM planning response into structured result.
+ * Returns: { type: 'undefined' } | { type: 'empty' } | { type: 'tools', tools: string[] }
+ */
 function parsePlannedToolsResponse(text, toolInventory) {
   if (!text) {
-    return [];
+    return { type: 'empty' };
+  }
+
+  const trimmed = text.trim().toLowerCase();
+
+  // Check for explicit "undefined" or "null" response (needs full tool list)
+  if (trimmed === 'undefined' || trimmed === 'null') {
+    return { type: 'undefined' };
   }
 
   const availableNames = toolInventory.map(
@@ -817,10 +835,9 @@ function parsePlannedToolsResponse(text, toolInventory) {
     availableNames.map((name) => [name.toLowerCase(), name]),
   );
 
-  // Helper: find best matching tool name (exact, then prefix, then stem-based word-boundary)
+  // Helper: find best matching tool name (exact, then prefix, then word-boundary, then fuzzy)
   function findToolMatch(input) {
     const lower = input.toLowerCase().replaceAll(/[\s-]/g, '_');
-    const inputStem = stemToken(lower);
 
     // Exact match
     if (lowerNameMap.has(lower)) {
@@ -839,15 +856,6 @@ function parsePlannedToolsResponse(text, toolInventory) {
         return value;
       }
     }
-    // Stem-based word-boundary match: stems must match
-    // e.g., "circularization" stems to "circular", "circularize" stems to "circular"
-    for (const [key, value] of lowerNameMap) {
-      const fragments = key.split('_');
-      const fragmentStems = fragments.map((f) => stemToken(f));
-      if (fragmentStems.includes(inputStem)) {
-        return value;
-      }
-    }
     // Fuzzy match: allow single character typo (edit distance of 1)
     for (const [key, value] of lowerNameMap) {
       if (levenshteinDistance(lower, key) === 1) {
@@ -863,6 +871,10 @@ function parsePlannedToolsResponse(text, toolInventory) {
 
     // Handle JSON array: ["set_target", "hohmann_transfer"]
     if (Array.isArray(parsed)) {
+      // Empty array is explicit "no tools needed"
+      if (parsed.length === 0) {
+        return { type: 'empty' };
+      }
       const sequence = [];
       for (const item of parsed) {
         const name = String(item).trim();
@@ -872,12 +884,15 @@ function parsePlannedToolsResponse(text, toolInventory) {
         }
       }
       if (sequence.length > 0) {
-        return sequence;
+        return { type: 'tools', tools: sequence };
       }
     }
 
     // Handle JSON object with "tools" key: {"tools": ["set_target", ...]}
     if (parsed && typeof parsed === 'object' && Array.isArray(parsed.tools)) {
+      if (parsed.tools.length === 0) {
+        return { type: 'empty' };
+      }
       const sequence = [];
       for (const item of parsed.tools) {
         const name = String(item).trim();
@@ -887,7 +902,7 @@ function parsePlannedToolsResponse(text, toolInventory) {
         }
       }
       if (sequence.length > 0) {
-        return sequence;
+        return { type: 'tools', tools: sequence };
       }
     }
 
@@ -904,7 +919,7 @@ function parsePlannedToolsResponse(text, toolInventory) {
           }
         }
         if (sequence.length > 0) {
-          return sequence;
+          return { type: 'tools', tools: sequence };
         }
       }
     }
@@ -918,6 +933,9 @@ function parsePlannedToolsResponse(text, toolInventory) {
     try {
       const parsed = JSON.parse(jsonMatch[0]);
       if (Array.isArray(parsed)) {
+        if (parsed.length === 0) {
+          return { type: 'empty' };
+        }
         const sequence = [];
         for (const item of parsed) {
           const name = String(item).trim();
@@ -927,7 +945,7 @@ function parsePlannedToolsResponse(text, toolInventory) {
           }
         }
         if (sequence.length > 0) {
-          return sequence;
+          return { type: 'tools', tools: sequence };
         }
       }
     } catch {
@@ -950,7 +968,7 @@ function parsePlannedToolsResponse(text, toolInventory) {
   for (const token of tokens) {
     const lower = token.toLowerCase();
     if (lower === 'none' || lower === '[]') {
-      return [];
+      return { type: 'empty' };
     }
 
     // Use fuzzy matching
@@ -960,12 +978,17 @@ function parsePlannedToolsResponse(text, toolInventory) {
     }
   }
 
-  return sequence;
+  if (sequence.length > 0) {
+    return { type: 'tools', tools: sequence };
+  }
+
+  // No valid tools parsed
+  return { type: 'empty' };
 }
 
 /**
  * Run a single planning query with specified temperature.
- * Returns array of parsed tool names, or empty array on failure.
+ * Returns structured result: { type: 'undefined' | 'empty' | 'tools', tools?: string[] }
  */
 async function runPlanningQuery(planningMessages, toolInventory, temperature = 0.8) {
   const controller = new AbortController();
@@ -977,7 +1000,7 @@ async function runPlanningQuery(planningMessages, toolInventory, temperature = 0
       [],
       controller.signal,
       {
-        format: { type: 'array', items: { type: 'string' } },
+        // Allow string for "undefined" response, or array for tools
         options: { temperature },
         silent: true, // Prompt logged once before parallel queries
       },
@@ -988,157 +1011,273 @@ async function runPlanningQuery(planningMessages, toolInventory, temperature = 0
     return parsePlannedToolsResponse(planText, toolInventory);
   } catch {
     clearTimeout(timeoutId);
-    return [];
+    return { type: 'empty' };
   }
 }
 
 /**
- * Compute consensus tools from multiple planning results.
- * Returns tools that appear in at least `threshold` results.
- * Falls back to majority (2+) if strict threshold yields nothing.
+ * Compute consensus tools from multiple structured planning results.
+ * Results are { type: 'undefined' | 'empty' | 'tools', tools?: string[] }
+ * Returns { tools: string[], undefinedCount: number, emptyCount: number }
  */
 function computeConsensusTools(results, threshold = 3) {
-  // Count occurrences of each tool across all results
+  const undefinedCount = results.filter((r) => r.type === 'undefined').length;
+  const emptyCount = results.filter((r) => r.type === 'empty').length;
+
+  // Extract tool arrays from results that have tools
+  const toolResults = results
+    .filter((r) => r.type === 'tools' && r.tools?.length > 0)
+    .map((r) => r.tools);
+
+  if (toolResults.length === 0) {
+    return { tools: [], undefinedCount, emptyCount };
+  }
+
+  // Count occurrences of each tool across all tool results
   const counts = new Map();
-  for (const result of results) {
-    for (const tool of result) {
+  for (const toolList of toolResults) {
+    for (const tool of toolList) {
       counts.set(tool, (counts.get(tool) || 0) + 1);
     }
   }
 
-  // Use first result's order, filtered by threshold
-  const firstResult = results[0] || [];
-  let consensus = firstResult.filter((tool) => counts.get(tool) >= threshold);
+  // Find tools that meet threshold (or majority fallback)
+  const effectiveThreshold = Math.min(threshold, toolResults.length);
+  let consensusSet = [...counts.entries()]
+    .filter(([, count]) => count >= effectiveThreshold)
+    .map(([tool]) => tool);
 
-  // Fallback to majority (2/3) if strict intersection is empty
-  if (consensus.length === 0 && threshold > 2) {
-    consensus = firstResult.filter((tool) => counts.get(tool) >= 2);
+  // Fallback to majority (2+) if strict threshold yields nothing
+  if (consensusSet.length === 0 && effectiveThreshold > 2) {
+    consensusSet = [...counts.entries()]
+      .filter(([, count]) => count >= 2)
+      .map(([tool]) => tool);
   }
 
-  return consensus;
+  // Use order from the result that contains the most consensus tools
+  let consensus = [];
+  if (consensusSet.length > 0) {
+    let bestResult = [];
+    let bestOverlap = 0;
+    for (const result of toolResults) {
+      const overlap = result.filter(t => consensusSet.includes(t)).length;
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestResult = result;
+      }
+    }
+    // Extract consensus tools in the order they appear in bestResult
+    consensus = bestResult.filter(t => consensusSet.includes(t));
+  }
+
+  // Check for order disagreement among results with the consensus tools
+  const orderDisagreement = hasOrderDisagreement(toolResults, consensus);
+
+  return { tools: consensus, undefinedCount, emptyCount, orderDisagreement };
 }
 
-async function planToolSequence(userPrompt, toolInventory, historySummary = '', agentPrompts) {
-  agentLog('[agent] Planning tool sequence (consensus mode)...');
-  if (!userPrompt || !userPrompt.trim()) {
-    return { sequence: [], rawText: '' };
+/**
+ * Check if tool results have different orderings of the same consensus tools.
+ */
+function hasOrderDisagreement(toolResults, consensusTools) {
+  if (consensusTools.length < 2) return false;
+
+  // Get the order of consensus tools from each result
+  const orders = toolResults
+    .map(tools => tools.filter(t => consensusTools.includes(t)))
+    .filter(filtered => filtered.length === consensusTools.length);
+
+  if (orders.length < 2) return false;
+
+  // Compare orders - if any differ, there's disagreement
+  const firstOrder = orders[0].join(',');
+  return orders.some(order => order.join(',') !== firstOrder);
+}
+
+/**
+ * Run an ordering query to resolve tool order when consensus disagrees on order.
+ */
+async function runOrderingQuery(consensusTools, userPrompt, toolInventory, agentPrompts) {
+  const toolDescriptions = consensusTools.map(name => {
+    const entry = findToolEntry(toolInventory, name);
+    const desc = entry?.openAi.function.description || 'No description';
+    return `- ${name}: ${desc}`;
+  }).join('\n');
+
+  const orderingPrompt = `TASK: Order these tools to fulfill the user's request.
+
+TOOLS TO ORDER:
+${toolDescriptions}
+
+USER REQUEST:
+${userPrompt}
+
+OUTPUT: Return tool names as a JSON array in execution order, e.g. ["first_tool", "second_tool"]`;
+
+  agentLog('[agent] Running ordering query to resolve order disagreement...');
+
+  const response = await callOllama(
+    [
+      { role: 'system', content: agentPrompts.role_for_assistant },
+      { role: 'user', content: orderingPrompt },
+    ],
+    [],
+    { options: { temperature: 0.3 } },
+  );
+
+  const text = extractAssistantText(response.message).trim();
+  const parsed = parsePlannedToolsResponse(text, toolInventory);
+
+  if (parsed.type === 'tools' && parsed.tools?.length > 0) {
+    // Only return tools that are in the consensus set
+    const orderedTools = parsed.tools.filter(t => consensusTools.includes(t));
+    if (orderedTools.length === consensusTools.length) {
+      return orderedTools;
+    }
   }
-  const catalog = buildOrderedToolCatalog(userPrompt, toolInventory);
-  // Select top N most relevant tools, keep score order (highest first)
-  const limitedCatalog = catalog.slice(0, PLANNING_CATALOG_LIMIT);
-  const toolNames = limitedCatalog.map((t) => t.name).join(', ');
-  agentLog(`[agent] Tools shown to planner: ${toolNames}`);
-  const catalogText = formatToolCatalogForPlanning(limitedCatalog);
-  const historySection = historySummary ? `History:\n${historySummary}\n\n` : '';
-  // Combine mission context (from Intro) + tool selection rules
+
+  // Fallback to original consensus order
+  agentLog('[agent] Ordering query did not resolve; using original order.');
+  return consensusTools;
+}
+
+/**
+ * Build planning messages with all tools catalog.
+ */
+function buildPlanningMessages(userPrompt, toolInventory, historySummary, agentPrompts, promptGuidance = '', statusInfo = '') {
+  const historySection = historySummary || 'This is the initial prompt.';
+  const toolsText = formatToolsByTier(toolInventory);
+
+  // Include status if available
+  const statusSection = statusInfo
+    ? `\n\nSTATUS:\n${statusInfo}`
+    : '';
+
+  // Include prompt guidance if available
+  const guidanceSection = promptGuidance
+    ? `\n\nWORKFLOW GUIDANCE:\n${promptGuidance}`
+    : '';
+
   const combinedPlanningPrompt = `${agentPrompts.role_for_assistant}\n\n${PLANNING_SYSTEM_PROMPT}`;
-  const planningMessages = [
+
+  return [
     {
       role: 'system',
       content: combinedPlanningPrompt,
     },
     {
       role: 'user',
-      content: `${historySection}Request: ${userPrompt}\n\nTOOL LIST: ${catalogText}`,
+      content: `TOOLS:\n${toolsText}${statusSection}\n\nHISTORY:\n${historySection}${guidanceSection}\n\nUSER REQUEST:\n${userPrompt}\n\nOUTPUT: ["tool_name"] or ["first_tool", "second_tool"]`,
     },
   ];
+}
+
+async function planToolSequence(userPrompt, toolInventory, historySummary = '', agentPrompts, promptGuidance = '', statusInfo = '') {
+  agentLog('[agent] Planning tool sequence (consensus mode)...');
+  if (!userPrompt || !userPrompt.trim()) {
+    return { sequence: [], needsAltIntro: false };
+  }
+
+  // Log tool counts
+  const commonTools = getCommonTools(toolInventory);
+  const otherTools = getOtherTools(toolInventory);
+  agentLog(`[agent] Tools: ${commonTools.length} common, ${otherTools.length} other`);
+
+  const planningMessages = buildPlanningMessages(
+    userPrompt,
+    toolInventory,
+    historySummary,
+    agentPrompts,
+    promptGuidance,
+    statusInfo,
+  );
 
   // Log the planning prompt once (before parallel queries)
   toLLMLog('[toLLM] ─── Planning Prompt ───');
   for (const message of planningMessages) {
-    toLLMLog(`  [${message.role}] ${message.content}`);
+    if (message.role === 'system') {
+      toLLMLog('[system]');
+    }
+    toLLMLog(message.content);
+    blankLine();
   }
 
+  const PLANNING_TEMPERATURES = [0.5, 0.8, 1.1];
+
   try {
-    // Run 3 planning queries in parallel with varied temperatures
-    // Default is 0.8; we vary around it (0.5 = focused, 0.8 = default, 1.1 = creative)
-    const PLANNING_TEMPERATURES = [0.5, 0.8, 1.1];
     agentLog(
       `[agent] Running ${PLANNING_TEMPERATURES.length} planning queries for consensus...`,
     );
 
-    const queryPromises = PLANNING_TEMPERATURES.map((temporary) =>
-      runPlanningQuery(planningMessages, toolInventory, temporary),
+    const queryPromises = PLANNING_TEMPERATURES.map((temperature) =>
+      runPlanningQuery(planningMessages, toolInventory, temperature),
     );
 
-    const results = await Promise.all(queryPromises);
+    let results = await Promise.all(queryPromises);
 
     // Log individual results for debugging
     for (const [index, r] of results.entries()) {
+      const toolsText = r.type === 'tools' && r.tools?.length > 0
+        ? r.tools.join(', ')
+        : `(${r.type})`;
       agentLog(
-        `[agent] Query ${index + 1} (temp=${PLANNING_TEMPERATURES[index]}): ${r.join(', ') || '(empty)'}`,
+        `[agent] Query ${index + 1} (temp=${PLANNING_TEMPERATURES[index]}): ${toolsText}`,
       );
     }
 
-    // Compute consensus (require all 3, fallback to 2/3 majority)
-    const sequence = computeConsensusTools(results, PLANNING_TEMPERATURES.length);
+    // Compute consensus and check for special conditions
+    const consensus = computeConsensusTools(results, PLANNING_TEMPERATURES.length);
+
+    // If order disagreement detected, run ordering query to resolve
+    if (consensus.orderDisagreement && consensus.tools.length >= 2) {
+      const orderedTools = await runOrderingQuery(
+        consensus.tools,
+        userPrompt,
+        toolInventory,
+        agentPrompts,
+      );
+      agentLog(`[agent] Ordered tools: ${orderedTools.join(' -> ')}`);
+      consensus.tools = orderedTools;
+    }
+
+    // If 2+ agents return empty, signal alt_intro needed
+    if (consensus.emptyCount >= 2) {
+      agentLog('[agent] Planning consensus: no tools determined (2+ empty). Needs alt_intro.');
+      return { sequence: [], needsAltIntro: true };
+    }
+
+    const sequence = consensus.tools;
     agentLog(`[agent] Consensus tools: ${sequence.join(', ') || '(none)'}`);
 
-    const filteredSequence = filterPlanSequenceByRelevance(
-      sequence,
-      userPrompt,
-      toolInventory,
-    );
-    const catalogSize = limitedCatalog.length;
-    if (
-      catalogSize >= 3 &&
-      filteredSequence.length >= Math.max(3, catalogSize - 1)
-    ) {
+    // Validate and dedupe tools
+    const seen = new Set();
+    const validSequence = sequence.filter((name) => {
+      if (seen.has(name)) return false;
+      if (!findToolEntry(toolInventory, name)) return false;
+      seen.add(name);
+      return true;
+    });
+
+    // Sanity checks
+    if (validSequence.length > MAX_SEQUENTIAL_PLAN_LENGTH) {
       agentWarn(
-        `[agent] Planning step selected ${filteredSequence.length}/${catalogSize} catalog tools. Treating plan as invalid.`,
+        `[agent] Planning returned ${validSequence.length} tools (exceeds limit of ${MAX_SEQUENTIAL_PLAN_LENGTH}). Needs alt_intro.`,
       );
-      return { sequence: [], rawText: '' };
+      return { sequence: [], needsAltIntro: true };
     }
 
-    // Sanity check: if we got way more tools than expected, discard
-    const MAX_REASONABLE_PLAN_LENGTH = 15;
-    if (filteredSequence.length > MAX_REASONABLE_PLAN_LENGTH) {
-      agentWarn(
-        `[agent] Planning returned ${filteredSequence.length} tools (likely parsing error). Ignoring plan.`,
-      );
-      return { sequence: [], rawText: '' };
-    }
-
-    if (filteredSequence.length > MAX_SEQUENTIAL_PLAN_LENGTH) {
-      agentWarn(
-        `[agent] Planning returned ${filteredSequence.length} tools (exceeds sequential limit of ${MAX_SEQUENTIAL_PLAN_LENGTH}). Falling back to open-ended loop.`,
-      );
-      return { sequence: [], rawText: '' };
-    }
-
-    if (filteredSequence.length > 0) {
-      agentLog(
-        `[agent] Planned tool order: ${filteredSequence.join(' -> ')}`,
-      );
+    if (validSequence.length > 0) {
+      agentLog(`[agent] Planned tool order: ${validSequence.join(' -> ')}`);
     } else {
-      agentLog('[agent] Planning step returned no tools (consensus yielded nothing).');
+      agentLog('[agent] Planning step returned no tools.');
     }
-    return { sequence: filteredSequence, rawText: '' };
+
+    return { sequence: validSequence, needsAltIntro: validSequence.length === 0 };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     agentWarn(`[agent] Planning step failed: ${message}`);
-    return { sequence: [], rawText: '' };
+    return { sequence: [], needsAltIntro: true };
   }
-}
-
-function filterPlanSequenceByRelevance(sequence, userPrompt, toolInventory) {
-  if (!Array.isArray(sequence) || sequence.length === 0) {
-    return [];
-  }
-  const seen = new Set();
-  const normalized = [];
-  for (const name of sequence) {
-    if (seen.has(name)) {
-      continue;
-    }
-    const entry = findToolEntry(toolInventory, name);
-    if (!entry) {
-      continue;
-    }
-    seen.add(name);
-    normalized.push(name);
-  }
-  return normalized;
 }
 
 function normalizeStructuredStatus(status) {
@@ -1284,68 +1423,6 @@ function safeParseArguments(rawArguments) {
   return rawArguments;
 }
 
-function selectRelevantTools(conversation, toolInventory) {
-  const latestUserText = getLatestUserText(conversation) ?? '';
-  const keywordInfo = buildKeywordInfo(latestUserText);
-
-  const scored = toolInventory
-    .map((entry) => ({
-      entry,
-      score: scoreToolEntry(entry, keywordInfo),
-    }))
-    .toSorted((a, b) => b.score - a.score);
-
-  const selected = [];
-  for (const item of scored) {
-    if (selected.length >= MAX_TOOLS_PER_CALL) {
-      break;
-    }
-    selected.push(item.entry.openAi);
-  }
-
-  for (const always of ALWAYS_INCLUDE_TOOLS) {
-    if (
-      selected.some((tool) => tool.function.name === always) ||
-      !toolInventory.some((entry) => entry.openAi.function.name === always)
-    ) {
-      continue;
-    }
-    const entry = toolInventory.find(
-      (candidate) => candidate.openAi.function.name === always,
-    );
-    if (entry) {
-      selected.push(entry.openAi);
-    }
-  }
-
-  if (selected.length < MIN_TOOLS_PER_CALL) {
-    for (const entry of toolInventory) {
-      if (selected.length >= MIN_TOOLS_PER_CALL) {
-        break;
-      }
-      if (
-        selected.some(
-          (tool) => tool.function.name === entry.openAi.function.name,
-        )
-      ) {
-        continue;
-      }
-      selected.push(entry.openAi);
-    }
-  }
-
-  const result =
-    selected.length > 0
-      ? selected.slice(0, MAX_TOOLS_PER_CALL)
-      : toolInventory
-          .slice(0, MAX_TOOLS_PER_CALL)
-          .map((entry) => entry.openAi);
-
-  const names = result.map((tool) => tool.function.name).join(', ');
-  agentLog(`[agent] Tools for this turn: ${names}`);
-  return result;
-}
-
 function findToolEntry(toolInventory, toolName) {
   return toolInventory.find(
     (entry) => entry.openAi.function.name === toolName,
@@ -1414,118 +1491,6 @@ function coercePrimitive(value) {
   return value;
 }
 
-function scoreToolEntry(entry, keywordInfo) {
-  const tokens = keywordInfo.tokens;
-  const stems = keywordInfo.stems;
-  if (tokens.length === 0) {
-    return 0;
-  }
-  let score = 0;
-  for (const [index, token] of tokens.entries()) {
-    const escapedToken = escapeRegExp(token);
-
-    // Exact token match in searchTokenSet - highest priority
-    if (entry.searchTokenSet?.has(token)) {
-      score += Math.min(token.length, 8) + 4; // boost exact matches
-    } else {
-      // Word boundary match at start of word (e.g., "target" matches "set_target")
-      const wordBoundaryStart = new RegExp(String.raw`\b${escapedToken}`, 'i');
-      if (wordBoundaryStart.test(entry.searchText)) {
-        score += 3;
-      }
-      // Contained anywhere (weak match, potential false positive)
-      else if (entry.searchText.includes(token)) {
-        score += 1;
-      }
-    }
-
-    // Name fragment matching with boundary awareness
-    if (entry.nameFragments?.length) {
-      for (const fragment of entry.nameFragments) {
-        if (fragment === token) {
-          score += 6; // exact fragment match
-          break;
-        }
-        // Token starts with fragment or fragment starts with token (prefix match)
-        if (fragment.startsWith(token) || token.startsWith(fragment)) {
-          score += 4;
-          break;
-        }
-        // Contains match - only if at word boundary
-        const fragBoundary = new RegExp(String.raw`\b${escapeRegExp(token)}`, 'i');
-        if (fragBoundary.test(fragment)) {
-          score += 2;
-          break;
-        }
-      }
-    }
-
-    // Stem match
-    const stem = stems[index];
-    if (stem && entry.stemTokenSet?.has(stem)) {
-      score += 4;
-    }
-  }
-
-  // Tier-based adjustments
-  const tier = entry.tier;
-  switch (tier) {
-  case 1: {
-    score += 10;        // Primary tools get bonus
-  
-  break;
-  }
-  case 2: {
-    score += 5;         // Supporting tools get small bonus
-  
-  break;
-  }
-  case 3: {
-    score *= 0.5;       // Specialized tools penalized
-  
-  break;
-  }
-  case -1: {
-    score = 0;          // Escape hatch tools excluded from auto-selection
-  
-  break;
-  }
-  // No default
-  }
-
-  return score;
-}
-
-function getLatestUserText(conversation) {
-  for (let index = conversation.length - 1; index >= 0; index -= 1) {
-    const message = conversation[index];
-    if (message.role === 'user' && typeof message.content === 'string') {
-      const marker = 'Current request:';
-      const content = message.content;
-      const markerIndex = content.lastIndexOf(marker);
-      if (markerIndex !== -1) {
-        return content.slice(markerIndex + marker.length).trim();
-      }
-      return content;
-    }
-  }
-  return;
-}
-
-function buildKeywordInfo(text) {
-  const tokens = tokenizeText(text);
-  const stems = tokens.map((token) => stemToken(token));
-  return { tokens, stems };
-}
-
-function buildPromptWithHistory(userPrompt, history) {
-  const summary = summarizeHistory(history, HISTORY_MAX_PROMPTS);
-  if (!summary) {
-    return userPrompt;
-  }
-  return `${summary}\n\nCurrent request:\n${userPrompt}`;
-}
-
 function buildFocusedToolPrompt(
   userQuery,
   toolEntry,
@@ -1533,6 +1498,7 @@ function buildFocusedToolPrompt(
   nextTool,
   step,
   total,
+  agentPrompts,
 ) {
   const tool = toolEntry.openAi.function;
   const parameters = tool.parameters?.properties ?? {};
@@ -1546,41 +1512,107 @@ function buildFocusedToolPrompt(
     return `  - ${key}: ${type}${request}${desc}`;
   }).join('\n');
 
-  const lines = [
-    `Step ${step}/${total}: Call "${tool.name}"`,
-    `Description: ${tool.description}`,
+  // Build system message with role, rules, task, and tool info
+  const systemLines = [
+    agentPrompts.role_for_assistant,
+    '',
+    SINGLE_TOOL_RULES,
+    '',
+    `TASK: Step ${step}/${total} - Call "${tool.name}"`,
+    '',
+    `TOOL: ${tool.name}`,
+    tool.description,
   ];
 
   if (parameterHints) {
-    lines.push(
+    systemLines.push(
       '',
-      'Parameters:',
+      'PARAMETERS:',
       parameterHints,
-      '',
-      'Extract values from the user request and call this tool NOW.',
-      `"${userQuery}"`,
     );
   }
 
-  if (previousResult) {
-    lines.push(
+  // Add context about previous/next steps if available
+  if (previousResult || nextTool) {
+    systemLines.push('', 'CONTEXT:');
+    if (previousResult) {
+      systemLines.push(`- Previous step: ${previousResult.tool} → ${previousResult.result}`);
+    }
+    if (nextTool) {
+      systemLines.push(`- Next step: ${nextTool}`);
+    }
+  }
+
+  systemLines.push('', 'USER REQUEST:');
+
+  return {
+    system: systemLines.join('\n'),
+    user: userQuery,
+  };
+}
+
+function buildToolRetryPrompt(
+  userQuery,
+  toolEntry,
+  errorMessage,
+  attempt,
+  maxAttempts,
+  step,
+  total,
+  agentPrompts,
+) {
+  const tool = toolEntry.openAi.function;
+  const parameters = tool.parameters?.properties ?? {};
+  const required = tool.parameters?.required ?? [];
+
+  const parameterHints = Object.entries(parameters).map(([key, schema]) => {
+    const request = required.includes(key) ? ' (required)' : '';
+    const type = schema.type || 'string';
+    const desc = schema.description ? ` - ${schema.description}` : '';
+    return `  - ${key}: ${type}${request}${desc}`;
+  }).join('\n');
+
+  // Build system message with role, rules, task, and tool info
+  const systemLines = [
+    agentPrompts.role_for_assistant,
+    '',
+    SINGLE_TOOL_RULES,
+    '',
+    `TASK: Step ${step}/${total} - Call "${tool.name}"`,
+    `ATTEMPT: ${attempt} of ${maxAttempts}`,
+    '',
+    `TOOL: ${tool.name}`,
+    tool.description,
+  ];
+
+  if (parameterHints) {
+    systemLines.push(
       '',
-      `Previous tool used: ${previousResult.tool} - ${previousResult.result}`,
+      'PARAMETERS:',
+      parameterHints,
     );
   }
 
-  if (nextTool) {
-    lines.push('', `Next tool used: ${nextTool}`);
-  }
+  systemLines.push(
+    '',
+    'PREVIOUS ERROR:',
+    errorMessage,
+    '',
+    'USER REQUEST:',
+  );
 
-  return lines.join('\n');
+  return {
+    system: systemLines.join('\n'),
+    user: userQuery,
+  };
 }
 
 function buildSummaryPrompt(userQuery, toolEvents) {
   const lines = [
-    `User request: ${userQuery}`,
+    'USER REQUEST:',
+    userQuery,
     '',
-    'Tools executed:',
+    'RESULTS:',
   ];
 
   for (const [index, event] of toolEvents.entries()) {
@@ -1588,7 +1620,16 @@ function buildSummaryPrompt(userQuery, toolEvents) {
     lines.push(`${index + 1}. ${event.name} ${status}: ${event.summary}`);
   }
 
-  lines.push('', 'Provide a brief summary of what was accomplished.');
+  lines.push(
+    '',
+    'INSTRUCTIONS:',
+    '1. Summarize ONLY what the RESULTS show was accomplished.',
+    '2. Do NOT suggest actions or next steps not shown in RESULTS.',
+    '3. If a tool failed, report the error.',
+    '4. Ask what the user wants to do next.',
+    '',
+    'Keep response under 50 words.',
+  );
 
   return lines.join('\n');
 }
@@ -1640,6 +1681,22 @@ function truncateText(text, limit) {
   return `${text.slice(0, Math.max(0, limit - 3))}...`;
 }
 
+/**
+ * Truncate text by removing characters from the middle.
+ * Preserves context at both start and end of text.
+ */
+function truncateMiddle(text, limit) {
+  if (!text || text.length <= limit) return text || '';
+
+  // Keep ~60% at start, ~40% at end (front-weighted for context)
+  const startLength = Math.floor(limit * 0.6);
+  const endLength = limit - startLength - 5; // 5 for " ... "
+
+  const start = text.slice(0, startLength);
+  const end = text.slice(-endLength);
+  return `${start} ... ${end}`;
+}
+
 function flattenWhitespace(text) {
   return text ? text.replaceAll(/\s+/g, ' ').trim() : '';
 }
@@ -1658,10 +1715,6 @@ function extractAssistantText(message) {
       .join('\n');
   }
   return '';
-}
-
-function escapeRegExp(value) {
-  return value.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 }
 
 function levenshteinDistance(a, b) {
@@ -1688,53 +1741,6 @@ function levenshteinDistance(a, b) {
   return matrix[b.length][a.length];
 }
 
-function detectPromisedToolUsage(text, toolInventory) {
-  if (!text) {
-    return [];
-  }
-  const verbs = ['call', 'run', 'use', 'invoke', 'execute', 'trigger'];
-  const matches = new Set();
-  const normalized = text.toLowerCase();
-  const textWindow = text.replaceAll(/\s+/g, ' ');
-  for (const entry of toolInventory) {
-    const toolName = entry.openAi.function.name;
-    const escapedName = escapeRegExp(toolName);
-    const pattern = new RegExp(
-      String.raw`\b(${verbs.join('|')})\b[^\.\n]{0,80}\b${escapedName}\b`,
-      'i',
-    );
-    if (pattern.test(textWindow)) {
-      matches.add(toolName);
-    }
-  }
-  const genericPattern = new RegExp(
-    String.raw`\b(${verbs.join('|')})\b[^\.\n]{0,60}\btool\b`,
-    'i',
-  );
-  if (genericPattern.test(normalized)) {
-    matches.add('tool');
-  }
-  return [...matches];
-}
-
-function isIncompleteAssistantResponse(message) {
-  const text = extractAssistantText(message).trim();
-  if (!text) {
-    return true;
-  }
-  const normalized = text.toLowerCase();
-  if (normalized === '{}' || normalized === '[]' || normalized === 'null' || normalized === 'undefined') {
-    return true;
-  }
-  if (text.includes('<|python_tag|>')) {
-    return true;
-  }
-  if (/^{"name":\s*".*"}\s*$/s.test(text)) {
-    return true;
-  }
-  return false;
-}
-
 function sanitizeToolText(text) {
   if (!text) {
     return '(no output)';
@@ -1747,51 +1753,6 @@ function sanitizeToolText(text) {
     .replaceAll(/\n{3,}/g, '\n\n')
     .trim();
   return cleaned.length > 0 ? cleaned : '(no output)';
-}
-
-function describeFailureReason(text, structuredContent) {
-  if (structuredContent?.reason) {
-    return structuredContent.reason;
-  }
-  const status = normalizeStructuredStatus(structuredContent?.status);
-  if (status === 'error' && structuredContent?.action) {
-    return `${structuredContent.action} failed`;
-  }
-  if (!text) {
-    return 'failed';
-  }
-  const normalized = text.toLowerCase();
-  if (normalized.includes('timeout')) {
-    return 'timed out';
-  }
-  if (normalized.includes('not connected')) {
-    return 'needs an active connection';
-  }
-  if (normalized.includes('no target')) {
-    return 'needs a target set first';
-  }
-  if (normalized.includes('not found')) {
-    return 'reported missing data';
-  }
-  return 'failed';
-}
-
-function buildIncompleteReminder(rawRequest, summaries) {
-  const trimmedRequest = rawRequest ? rawRequest.trim() : '';
-  const lines = [ 'Reminder: the user request still needs a final answer.'];
-  if (trimmedRequest) {
-    lines.push('', 'Request:', trimmedRequest);
-  }
-  if (summaries && summaries.length > 0) {
-    lines.push('', 'Progress so far:');
-    for (const [index, entry] of summaries.slice(-5).entries()) {
-      lines.push(`${index + 1}. ${entry}`);
-    }
-  }
-  lines.push('', 
-    'Continue the task, calling any required tools, and reply with a final answer when complete.',
-  );
-  return lines.join('\n');
 }
 
 function sanitizeCpuId(value) {
@@ -1857,66 +1818,6 @@ function removeScriptNoise(text, isError) {
   return cleaned.length > 0 ? cleaned : text;
 }
 
-function extractToolNamesFromText(text, toolInventory) {
-  if (!text) {
-    return [];
-  }
-  const normalized = text.toLowerCase();
-  const collapsed = normalized.replaceAll(/[\s_-]/g, '');
-  const matches = new Set();
-  for (const entry of toolInventory) {
-    const name = entry.openAi.function.name;
-    for (const token of entry.searchTokens ?? []) {
-      if (normalized.includes(token) || collapsed.includes(token.replaceAll(/[\s_-]/g, ''))) {
-        matches.add(name);
-        break;
-      }
-    }
-  }
-  return [...matches];
-}
-
-function addFollowupReminderIfNeeded(
-  text,
-  toolInventory,
-  conversation,
-  { force = false, preferredTool, failureReason } = {},
-) {
-  if (!force) {
-    return;
-  }
-  const referencedTools =
-    preferredTool && preferredTool.length > 0
-      ? [preferredTool]
-      : extractToolNamesFromText(text, toolInventory);
-  if (referencedTools.length === 0) {
-    return;
-  }
-  const listed = referencedTools.slice(0, 4).join(', ');
-  const reason =
-    failureReason && preferredTool
-      ? `${preferredTool} ${failureReason}`
-      : `the previous result referenced ${listed}`;
-  const instruction = preferredTool
-    ? `Retry ${preferredTool} (adjust parameters if needed) before calling other tools or answering.`
-    : 'Call the needed tool(s) and retry before answering.';
-  conversation.push({
-    role: 'user',
-    content: `Reminder: ${reason}. ${instruction}`,
-  });
-}
-
-function addRecommendationReminder(entry, conversation) {
-  if (!entry?.recommendedTools?.length) {
-    return;
-  }
-  const listed = entry.recommendedTools.slice(0, 4).join(', ');
-  conversation.push({
-    role: 'user',
-    content: `Reminder: run ${listed} as required before retrying.`,
-  });
-}
-
 /**
  * Sequential tool execution - forces each tool in sequence with focused prompts.
  * Each tool gets its own Ollama call with only that tool available.
@@ -1928,8 +1829,6 @@ async function runSequentialToolExecution(
   client,
   agentPrompts,
 ) {
-  // Combine mission context (from Intro) + tool calling rules
-  const combinedIterationPrompt = `${agentPrompts.role_for_assistant}\n\n${SINGLE_TOOL_SYSTEM_PROMPT}`;
   const toolEvents = [];
   let previousResult;
 
@@ -1951,6 +1850,7 @@ async function runSequentialToolExecution(
       nextTool,
       index + 1,
       toolSequence.length,
+      agentPrompts,
     );
 
     agentLog(
@@ -1964,14 +1864,14 @@ async function runSequentialToolExecution(
 
     while (attempts < maxAttempts) {
       attempts++;
-      const promptToUse = attempts === 1
-        ? focusedPrompt
-        : `You MUST call the "${toolName}" tool NOW. This is required.\n\n${focusedPrompt}`;
+      const systemToUse = attempts === 1
+        ? focusedPrompt.system
+        : `You MUST call the "${toolName}" tool NOW. This is required.\n\n${focusedPrompt.system}`;
 
       const response = await callOllama(
         [
-          { role: 'system', content: combinedIterationPrompt },
-          { role: 'user', content: promptToUse },
+          { role: 'system', content: systemToUse },
+          { role: 'user', content: focusedPrompt.user },
         ],
         [toolEntry.openAi],
         { format: 'json' },
@@ -1995,48 +1895,99 @@ async function runSequentialToolExecution(
       }
     }
 
-    toToolLog(toolName, Object.keys(arguments_).length > 0 ? JSON.stringify(arguments_) : '(no args)');
+    // Tool execution with retry on error
+    const maxToolAttempts = 2;
+    let toolSucceeded = false;
 
-    try {
-      const result = await client.callTool(
-        { name: toolName, arguments: arguments_ },
-        undefined,
-        {
-          timeout: config.toolTimeout,
-          resetTimeoutOnProgress: true,
+    for (let toolAttempt = 1; toolAttempt <= maxToolAttempts; toolAttempt++) {
+      toToolLog(toolName, Object.keys(arguments_).length > 0 ? JSON.stringify(arguments_) : '(no args)');
+
+      try {
+        const result = await client.callTool(
+          { name: toolName, arguments: arguments_ },
+          undefined,
+          {
+            timeout: config.toolTimeout,
+            resetTimeoutOnProgress: true,
+          }
+        );
+        const textResult = formatMcpResult(result);
+        fromToolLog(toolName, textResult.split('\n')[0]);
+        say(textResult.split('\n')[0]);
+        if (textResult.includes('\n')) {
+          for (const line of textResult.split('\n').slice(1)) {
+            if (line.trim()) fromToolLog(toolName, `  ${line}`);
+          }
         }
-      );
-      const textResult = formatMcpResult(result);
-      fromToolLog(toolName, textResult.split('\n')[0]);
-      say(textResult.split('\n')[0]);
-      if (textResult.includes('\n')) {
-        for (const line of textResult.split('\n').slice(1)) {
-          if (line.trim()) fromToolLog(toolName, `  ${line}`);
+
+        const success = didToolSucceed(result);
+        toolEvents.push({
+          name: toolName,
+          success,
+          summary: truncateText(textResult, HISTORY_EVENT_TEXT_LIMIT),
+        });
+
+        previousResult = { tool: toolName, result: textResult };
+        toolSucceeded = success;
+
+        if (!success) {
+          agentWarn(`[agent] Tool ${toolName} failed. Stopping sequence.`);
+          // Log raw result for debugging
+          if (result.structuredContent) {
+            agentWarn(`[agent] Structured: ${JSON.stringify(result.structuredContent)}`);
+          }
         }
+        break; // Exit retry loop on successful call (even if tool reports failure)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+
+        if (toolAttempt < maxToolAttempts) {
+          agentWarn(`[agent] Tool ${toolName} threw error: ${message}. Retrying...`);
+
+          // Build retry prompt with error info
+          const retryPrompt = buildToolRetryPrompt(
+            userPrompt,
+            toolEntry,
+            message,
+            toolAttempt + 1,
+            maxToolAttempts,
+            index + 1,
+            toolSequence.length,
+            agentPrompts,
+          );
+
+          // Call LLM again to get new arguments
+          const retryResponse = await callOllama(
+            [
+              { role: 'system', content: retryPrompt.system },
+              { role: 'user', content: retryPrompt.user },
+            ],
+            [toolEntry.openAi],
+            { format: 'json' },
+          );
+
+          const retryToolCalls = retryResponse.message?.tool_calls ?? [];
+          if (retryToolCalls.length > 0) {
+            arguments_ = normalizeArgumentsForEntry(
+              toolEntry,
+              safeParseArguments(retryToolCalls[0].function?.arguments),
+            );
+          }
+          continue;
+        }
+
+        // Final attempt failed
+        agentError(`[agent] Tool ${toolName} threw error: ${message}`);
+        toolEvents.push({
+          name: toolName,
+          success: false,
+          summary: truncateText(message, HISTORY_EVENT_TEXT_LIMIT),
+        });
       }
+    }
 
-      const success = didToolSucceed(result);
-      toolEvents.push({
-        name: toolName,
-        success,
-        summary: truncateText(textResult, HISTORY_EVENT_TEXT_LIMIT),
-      });
-
-      previousResult = { tool: toolName, result: textResult };
-
-      if (!success) {
-        agentWarn(`[agent] Tool ${toolName} failed. Stopping sequence.`);
-        break;
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      agentError(`[agent] Tool ${toolName} threw error: ${message}`);
-      toolEvents.push({
-        name: toolName,
-        success: false,
-        summary: truncateText(message, HISTORY_EVENT_TEXT_LIMIT),
-      });
-      break;
+    if (!toolSucceeded) {
+      break; // Exit main tool sequence loop
     }
   }
 
@@ -2044,212 +1995,168 @@ async function runSequentialToolExecution(
 }
 
 /**
- * Core agent loop:
- *  - Ask Ollama for the next assistant turn.
- *  - If the model emitted tool_calls, run the MCP tool and feed the result back.
- *  - Repeat until a natural-language reply is produced.
+ * Preflight check: expand user request AND check for matching prompt templates.
+ * Returns { expandedRequest, promptGuidance }
  */
-async function runAgentLoop(
-  conversation,
+async function runPreflightCheck(userRequest, previousAssistantResponse, toolInventory, promptInventory, client, agentPrompts) {
+  let expandedRequest = userRequest;
+  let promptGuidance = '';
+
+  // 1. Expand requests that may reference previous response
+  agentLog('[agent] Running preflight expansion...');
+
+  // Get tier 1 and 2 tool names for context
+  const commonToolNames = getCommonTools(toolInventory)
+    .map(t => t.openAi.function.name)
+    .join(', ');
+
+  // Get current status
+  let statusInfo = '';
+  const statusData = await readResource(client, 'ksp://status');
+  if (statusData) {
+    if (statusData.error) {
+      agentLog(`[agent] Preflight status error: ${statusData.error}`);
+    } else {
+      statusInfo = formatStatusResource(statusData);
+      if (!statusInfo) {
+        agentLog('[agent] Preflight status: formatStatusResource returned empty');
+      }
+    }
+  } else {
+    agentLog('[agent] Preflight status: readResource returned nothing');
+  }
+  const statusSection = statusInfo ? `\nSTATUS:\n${statusInfo}\n` : '';
+
+  const preflightPrompt = `TOOLS: ${commonToolNames}
+${statusSection}
+CONTEXT (for reference only):
+${previousAssistantResponse}
+
+TASK: Rewrite the user input as a complete, self-contained request.
+- If the input references the context (e.g., "yes", "do it", "the first one"), incorporate the relevant details.
+- If the input is already complete, return it unchanged.
+- Replace invalid names with valid names from TOOLS or STATUS. User STT may mangle proper nouns.
+- NEVER return the CONTEXT itself.
+
+USER INPUT:
+${userRequest}
+
+OUTPUT:`;
+
+  const response = await callOllama(
+    [
+      { role: 'system', content: agentPrompts.role_for_assistant },
+      { role: 'user', content: preflightPrompt },
+    ],
+    [],
+    { options: { temperature: 0.3 } },
+  );
+
+  const expanded = extractAssistantText(response.message).trim();
+
+  // If LLM returned something meaningful and different, use it
+  if (expanded && expanded.length > 0 && expanded !== userRequest) {
+    agentLog(`[agent] Preflight expanded: "${expanded}"`);
+    expandedRequest = expanded;
+  }
+
+  // 2. Check for matching prompt template (always, for all queries)
+  const promptMatch = await matchPromptToIntent(expandedRequest, promptInventory, agentPrompts);
+  if (promptMatch.matched) {
+    agentLog(`[agent] Matched prompt template: ${promptMatch.prompt}`);
+    try {
+      const { messages } = await client.getPrompt(promptMatch.prompt, promptMatch.args);
+      promptGuidance = messages[0]?.content?.text || '';
+      if (promptGuidance) {
+        agentLog(`[agent] Prompt guidance: ${truncateText(promptGuidance, 100)}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      agentWarn(`[agent] Failed to get prompt: ${message}`);
+    }
+  }
+
+  return { expandedRequest, promptGuidance };
+}
+
+/**
+ * Alt-intro process: when planning returns no tools, get context and prompt user.
+ * Returns LLM's response (either a direct answer or a clarifying question).
+ */
+async function runAltIntroProcess(
+  userPrompt,
   toolInventory,
+  history,
+  agentPrompts,
   client,
-  requestContext = {},
 ) {
-  let reminderCount = 0;
-  let toolCallCount = 0;
-  let iterations = 0;
-  const toolEvents = [];
-  const progressSummaries = [];
+  agentLog('[agent] Running alt_intro process...');
 
-  while (iterations < config.maxIterations) {
-    iterations += 1;
-    const toolsForThisTurn = selectRelevantTools(conversation, toolInventory);
-    agentLog(
-      `[agent] Asking Ollama (${config.model}) with ${conversation.length} messages and ${toolsForThisTurn.length} tool(s)...`,
-    );
-
-    const response = await callOllama(conversation, toolsForThisTurn);
-    const assistantMessage = response.message;
-    if (!assistantMessage) {
-      throw new Error('Ollama response missing assistant message');
-    }
-    conversation.push(assistantMessage);
-
-    const toolCalls = assistantMessage.tool_calls ?? [];
-    if (toolCalls.length === 0) {
-      if (toolCallCount === 0 && reminderCount < MAX_TOOL_REMINDERS) {
-        reminderCount += 1;
-        agentLog(
-          '[agent] Assistant replied without using a tool. Sending reminder...',
-        );
-        conversation.push({
-          role: 'user',
-          content: TOOL_REMINDER_PROMPT,
-        });
-        continue;
-      }
-      if (
-        isIncompleteAssistantResponse(assistantMessage) &&
-        reminderCount < MAX_TOOL_REMINDERS
-      ) {
-        reminderCount += 1;
-        agentLog(
-          '[agent] Assistant response was incomplete. Asking it to continue...',
-        );
-        const reminderContent = buildIncompleteReminder(
-          requestContext.rawRequest ?? getLatestUserText(conversation),
-          progressSummaries,
-        );
-        conversation.push({
-          role: 'user',
-          content: reminderContent || INCOMPLETE_RESPONSE_PROMPT,
-        });
-        continue;
-      }
-      const content = extractAssistantText(assistantMessage);
-      const promisedTools = detectPromisedToolUsage(content, toolInventory);
-      if (promisedTools.length > 0 && reminderCount < MAX_TOOL_REMINDERS) {
-        reminderCount += 1;
-        const listed =
-          promisedTools[0] === 'tool'
-            ? 'the referenced tool'
-            : promisedTools.join(', ');
-        agentLog(
-          '[agent] Assistant promised a tool call but none was made. Requesting follow-up...',
-        );
-        conversation.push({
-          role: 'user',
-          content: `Reminder: you said you would call ${listed}, but no tool call was sent. Call the tool now and wait for its output before responding.`,
-        });
-        continue;
-      }
-      agentLog('[agent] Model returned final response.');
-      return { content, toolEvents };
-    }
-
-    for (const call of toolCalls) {
-      const name = call.function?.name;
-      if (!name) {
-        agentWarn('[agent] Received tool call without name. Skipping.');
-        continue;
-      }
-
-      const rawArguments = safeParseArguments(call.function?.arguments);
-      const toolEntry = findToolEntry(toolInventory, name);
-      const arguments_ = normalizeArgumentsForEntry(toolEntry, rawArguments);
-      toToolLog(name, Object.keys(arguments_).length > 0 ? JSON.stringify(arguments_) : '(no args)');
-
-      try {
-        const result = await client.callTool(
-          { name, arguments: arguments_ },
-          undefined,
-          {
-            timeout: config.toolTimeout,
-            resetTimeoutOnProgress: true,
-          }
-        );
-        toolCallCount += 1;
-        const textResult = formatMcpResult(result);
-        fromToolLog(name, textResult.split('\n')[0]);
-        say(textResult.split('\n')[0]);
-        if (textResult.includes('\n')) {
-          for (const line of textResult.split('\n').slice(1)) {
-            if (line.trim()) fromToolLog(name, `  ${line}`);
-          }
-        }
-        const structuredSummaryLine = buildStructuredSummaryLine(
-          result.structuredContent,
-        );
-        const summarySource =
-          structuredSummaryLine ||
-          flattenWhitespace(textResult) ||
-          '(no output)';
-        const summaryText = truncateText(
-          summarySource,
-          HISTORY_EVENT_TEXT_LIMIT,
-        );
-        const toolSuccess = didToolSucceed(result);
-        toolEvents.push({
-          name,
-          success: toolSuccess,
-          summary: summaryText,
-        });
-        if (toolSuccess && summaryText) {
-          const progressEntry = structuredSummaryLine
-            ? truncateText(structuredSummaryLine, HISTORY_EVENT_TEXT_LIMIT)
-            : summaryText;
-          progressSummaries.push(progressEntry);
-        }
-        conversation.push({
-          role: 'tool',
-          tool_name: name,
-          content: textResult,
-        });
-        if (!toolSuccess) {
-          const failureReason = describeFailureReason(
-            textResult,
-            result.structuredContent,
-          );
-          addFollowupReminderIfNeeded(
-            textResult,
-            toolInventory,
-            conversation,
-            {
-              force: true,
-              preferredTool: name,
-              failureReason,
-            },
-          );
-          addRecommendationReminder(toolEntry, conversation);
-          return { content: textResult, toolEvents };
-        }
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : String(error);
-        const errorBlock = sanitizeToolText(`Tool ${name} failed: ${message}`);
-        agentError(`[agent] Tool execution failed: ${message}`);
-        toolEvents.push({
-          name,
-          success: false,
-          summary: truncateText(message, HISTORY_EVENT_TEXT_LIMIT),
-        });
-        conversation.push({
-          role: 'tool',
-          tool_name: name,
-          content: errorBlock,
-        });
-        addFollowupReminderIfNeeded(errorBlock, toolInventory, conversation, {
-          force: true,
-          preferredTool: name,
-          failureReason: describeFailureReason(message),
-        });
-        addRecommendationReminder(toolEntry, conversation);
-        return { content: errorBlock, toolEvents };
+  // 1. Try to get status from ksp://status resource
+  let statusInfo = '';
+  if (client) {
+    const statusData = await readResource(client, 'ksp://status');
+    if (statusData && !statusData.error) {
+      statusInfo = formatStatusResource(statusData);
+      if (statusInfo) {
+        agentLog(`[agent] Status: ${truncateText(statusInfo, 100)}`);
       }
     }
   }
 
-  // Max iterations reached - return last assistant message content or empty
-  agentWarn(
-    `[agent] Max iterations (${config.maxIterations}) reached. Returning last response.`,
+  // 2. Build the alt-intro prompt for the LLM
+  const historySummary = summarizeHistory(history, HISTORY_MAX_PROMPTS);
+  const commonToolsText = formatCommonTools(toolInventory);
+
+  const altIntroPrompt = `${agentPrompts.role_for_assistant}
+
+The planning stage could not determine which tools to use for this request.
+
+COMMON TOOLS:
+${commonToolsText}
+
+CONTEXT:
+${statusInfo ? `Current status: ${statusInfo}` : 'No status available.'}
+${historySummary || 'This is the initial prompt.'}
+
+USER REQUEST:
+${userPrompt}
+
+OUTPUT: Ask ONE short clarifying question to understand which tool(s) would help.`;
+
+  // 3. Call LLM to generate response
+  toLLMLog('[toLLM] ─── Alt-Intro Prompt ───');
+  toLLMLog(`[system] ${altIntroPrompt.split('\n').slice(0, 3).join(' ')}`);
+
+  const response = await callOllama(
+    [
+      { role: 'system', content: altIntroPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+    [],
   );
-  const lastAssistant = conversation
-    .toReversed()
-    .find((m) => m.role === 'assistant');
-  return { content: lastAssistant?.content ?? '', toolEvents };
+
+  const answer = extractAssistantText(response.message);
+  return answer;
 }
 
 async function main() {
   const {
     client,
     toolInventory,
+    resourceInventory,
+    promptInventory,
     transport,
-    toolPrimerMessage,
   } = await connectToMcp();
+
+  // Log resource and prompt counts (if any)
+  if (resourceInventory.length > 0 || promptInventory.length > 0) {
+    agentLog(`[agent] Resources: ${resourceInventory.length}, Prompts: ${promptInventory.length}`);
+  }
 
   // Generate dynamic prompts from tool catalog
   agentLog('[agent] Generating agent prompts from tool catalog...');
-  const agentPrompts = await generateAgentPrompts(toolInventory);
+  const agentPrompts = await generateAgentPrompts(toolInventory, client);
 
   const rl = readline.createInterface({
     input,
@@ -2262,15 +2169,6 @@ async function main() {
 
   let shuttingDown = false;
   const commandHistory = [];
-
-  const conversation = [
-    {
-      role: 'system',
-      content: toolPrimerMessage
-        ? `${config.systemPrompt}\n\n${toolPrimerMessage}`
-        : config.systemPrompt,
-    },
-  ];
 
   // Show and speak the agent's role
   blankLine();
@@ -2332,22 +2230,45 @@ async function main() {
       break;
     }
 
+    // Preflight: expand request AND check for matching prompt template
+    const lastEntry = commandHistory.at(-1);
+    // Use full response with middle truncation, fallback to intro greeting for first input
+    const previousResponse = lastEntry?.fullResponse
+      ? truncateMiddle(lastEntry.fullResponse, 1000)
+      : agentPrompts.role_for_user;
+    const { expandedRequest, promptGuidance } = await runPreflightCheck(
+      trimmedInput,
+      previousResponse,
+      toolInventory,
+      promptInventory,
+      client,
+      agentPrompts,
+    );
+
+    // Get current status for planning context
+    let statusInfo = '';
+    const statusData = await readResource(client, 'ksp://status');
+    if (statusData && !statusData.error) {
+      statusInfo = formatStatusResource(statusData);
+    }
+
     const historySummary = summarizeHistory(commandHistory, HISTORY_MAX_PROMPTS);
     const planningResult = await planToolSequence(
-      trimmedInput,
+      expandedRequest,
       toolInventory,
       historySummary,
       agentPrompts,
+      promptGuidance,
+      statusInfo,
     );
     blankLine();
 
     try {
       let answer = '';
       let toolEvents = [];
-      let shouldResetConversation = false;
 
       if (planningResult.sequence.length > 0) {
-        // Sequential tool execution - no history needed
+        // Sequential tool execution - planned tools found
         separator('EXECUTION');
         agentLog(
           `Running ${planningResult.sequence.length} tools: ${planningResult.sequence.join(' → ')}`,
@@ -2375,24 +2296,18 @@ async function main() {
           [],
         );
         answer = extractAssistantText(summaryResponse.message);
-      } else {
-        // No tools found - open-ended query with history
-        agentLog('[agent] No tools planned. Running open-ended query...');
-        const promptWithHistory = buildPromptWithHistory(trimmedInput, commandHistory);
-        conversation.push({
-          role: 'user',
-          content: promptWithHistory,
-        });
-
-        const result = await runAgentLoop(
-          conversation,
+      } else if (planningResult.needsAltIntro) {
+        // No tools determined - run alt_intro process
+        answer = await runAltIntroProcess(
+          trimmedInput,
           toolInventory,
+          commandHistory,
+          agentPrompts,
           client,
-          { rawRequest: trimmedInput },
         );
-        answer = result.content;
-        toolEvents = result.toolEvents;
-        shouldResetConversation = true;
+      } else {
+        // Empty sequence but no alt_intro needed (shouldn't happen, but handle gracefully)
+        answer = 'I could not determine which tools to use for your request. Please try rephrasing.';
       }
 
       blankLine();
@@ -2406,10 +2321,8 @@ async function main() {
           flattenWhitespace(answer),
           HISTORY_RESULT_TEXT_LIMIT,
         ),
+        fullResponse: answer,
       });
-      if (shouldResetConversation) {
-        conversation.splice(1);
-      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       agentError(`[agent] Failed to get answer: ${message}`);
