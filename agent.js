@@ -10,6 +10,7 @@
  */
 
 import 'dotenv/config';
+import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline/promises';
@@ -51,6 +52,23 @@ const ENABLE_COLOR =
   process.stdout.isTTY &&
   (process.env.NO_COLOR ?? '').toLowerCase() !== '1';
 
+// File logging setup
+const LOG_FILE = process.env.LOG_FILE;
+let logStream;
+if (LOG_FILE) {
+  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+}
+
+function writeToLogFile(message) {
+  if (logStream) {
+    const timestamp = new Date().toISOString();
+    logStream.write(`[${timestamp}] ${message}\n`);
+  }
+}
+
+// Debug mode flag (set after config is parsed)
+let debugMode = false;
+
 function colorize(message, color) {
   if (!ENABLE_COLOR || !color) {
     return message;
@@ -58,21 +76,30 @@ function colorize(message, color) {
   return `${color}${message}${COLOR_CODES.reset}`;
 }
 
-function makeLogger(method, color) {
+function makeLogger(method, color, isDebugOnly = true) {
   return (message, ...rest) => {
-    if (rest.length > 0) {
-      console[method](colorize(message, color), ...rest);
-    } else {
-      console[method](colorize(message, color));
+    const fullMessage = rest.length > 0 ? `${message} ${rest.join(' ')}` : String(message);
+    writeToLogFile(fullMessage);
+
+    // Only show to console if: not debug-only, OR debug mode is enabled
+    if (!isDebugOnly || debugMode) {
+      if (rest.length > 0) {
+        console[method](colorize(message, color), ...rest);
+      } else {
+        console[method](colorize(message, color));
+      }
     }
   };
 }
 
 function blankLine() {
-  process.stdout.write('\n');
+  if (debugMode) {
+    process.stdout.write('\n');
+  }
 }
 
 function separator(label = '') {
+  if (!debugMode) return;
   const line = '─'.repeat(10);
   if (label) {
     console.log(colorize(`${line} ${label} ${line}`, COLOR_CODES.toHuman));
@@ -81,31 +108,44 @@ function separator(label = '') {
   }
 }
 
-// Basic loggers
-const toHumanLog = makeLogger('log', COLOR_CODES.toHuman);
-const toHumanWarn = makeLogger('warn', COLOR_CODES.warn);
-const toHumanError = makeLogger('error', COLOR_CODES.error);
-const fromLLMLog = makeLogger('log', COLOR_CODES.fromLLM);
-const toLLMLog = makeLogger('log', COLOR_CODES.toLLM);
+// Debug-only loggers (hidden in default mode)
+const toHumanLog = makeLogger('log', COLOR_CODES.toHuman, true);
+const toHumanWarn = makeLogger('warn', COLOR_CODES.warn, true);
+const toHumanError = makeLogger('error', COLOR_CODES.error, false); // errors always shown
+const fromLLMLog = makeLogger('log', COLOR_CODES.fromLLM, true);
+const toLLMLog = makeLogger('log', COLOR_CODES.toLLM, true);
 
-// Tool loggers with dynamic tool name in label
+// Always-shown logger (for final assistant answers)
+const assistantLog = makeLogger('log', COLOR_CODES.fromLLM, false);
+
+// Tool loggers with dynamic tool name in label (debug-only)
 function toToolLog(toolName, message, ...rest) {
   const label = `[toTool-${toolName}]`;
   const formatted = `${label} ${message}`;
-  if (rest.length > 0) {
-    console.log(colorize(formatted, COLOR_CODES.toTool), ...rest);
-  } else {
-    console.log(colorize(formatted, COLOR_CODES.toTool));
+  const fullMessage = rest.length > 0 ? `${formatted} ${rest.join(' ')}` : formatted;
+  writeToLogFile(fullMessage);
+
+  if (debugMode) {
+    if (rest.length > 0) {
+      console.log(colorize(formatted, COLOR_CODES.toTool), ...rest);
+    } else {
+      console.log(colorize(formatted, COLOR_CODES.toTool));
+    }
   }
 }
 
 function fromToolLog(toolName, message, ...rest) {
   const label = `[fromTool-${toolName}]`;
   const formatted = `${label} ${message}`;
-  if (rest.length > 0) {
-    console.log(colorize(formatted, COLOR_CODES.fromTool), ...rest);
-  } else {
-    console.log(colorize(formatted, COLOR_CODES.fromTool));
+  const fullMessage = rest.length > 0 ? `${formatted} ${rest.join(' ')}` : formatted;
+  writeToLogFile(fullMessage);
+
+  if (debugMode) {
+    if (rest.length > 0) {
+      console.log(colorize(formatted, COLOR_CODES.fromTool), ...rest);
+    } else {
+      console.log(colorize(formatted, COLOR_CODES.fromTool));
+    }
   }
 }
 
@@ -113,7 +153,6 @@ function fromToolLog(toolName, message, ...rest) {
 const agentLog = toHumanLog;
 const agentWarn = toHumanWarn;
 const agentError = toHumanError;
-const assistantLog = fromLLMLog;
 
 // Module-level readline for confirmations (set by main)
 let confirmationRl;
@@ -243,6 +282,7 @@ const {
     maxRetries,
     coreTools,
     toolTimeout,
+    debug,
   },
 } = parseArgs({
   options: {
@@ -284,6 +324,10 @@ const {
       type: 'string',
       default: process.env.TOOL_TIMEOUT ?? '900000',  // 15 minutes for long-running ops
     },
+    debug: {
+      type: 'boolean',
+      default: process.env.DEBUG === '1' || process.env.DEBUG === 'true',
+    },
   },
   allowPositionals: false,
 });
@@ -313,7 +357,33 @@ const config = {
   maxRetries: parsePositiveInt(maxRetries, 3),
   coreTools,
   toolTimeout: parsePositiveInt(toolTimeout, 600_000),
+  debug: Boolean(debug),
 };
+
+// Set debug mode now that config is available
+debugMode = config.debug;
+
+// Progress spinner for non-debug mode
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+let spinnerInterval;
+let spinnerIndex = 0;
+
+function startSpinner(message = 'Thinking') {
+  if (debugMode) return; // Don't show spinner in debug mode
+  stopSpinner(); // Stop any existing spinner first
+  spinnerIndex = 0;
+  spinnerInterval = setInterval(() => {
+    process.stdout.write(`\r${SPINNER_FRAMES[spinnerIndex++ % SPINNER_FRAMES.length]} ${message}...`);
+  }, 80);
+}
+
+function stopSpinner() {
+  if (spinnerInterval) {
+    clearInterval(spinnerInterval);
+    spinnerInterval = undefined;
+    process.stdout.write('\r\u001B[K'); // Clear line
+  }
+}
 
 if (!['stdio', 'http'].includes(config.transport)) {
   console.error(
@@ -508,61 +578,62 @@ function formatStatusResource(status) {
   return parts.join(', ');
 }
 
-/**
- * Format prompt inventory for LLM matching.
- * Returns text list of available prompts with descriptions.
- */
-function formatPromptsForMatching(promptInventory) {
-  if (!promptInventory?.length) return '';
-  return promptInventory.map(p => {
-    const parameterList = p.arguments?.map(a => `${a.name}${a.required ? '' : '?'}`).join(', ') || '';
-    return `- ${p.name}(${parameterList}): ${p.description || 'No description'}`;
-  }).join('\n');
-}
+// Prompt template matching disabled for now
+// /**
+//  * Format prompt inventory for LLM matching.
+//  * Returns text list of available prompts with descriptions.
+//  */
+// function formatPromptsForMatching(promptInventory) {
+//   if (!promptInventory?.length) return '';
+//   return promptInventory.map(p => {
+//     const parameterList = p.arguments?.map(a => `${a.name}${a.required ? '' : '?'}`).join(', ') || '';
+//     return `- ${p.name}(${parameterList}): ${p.description || 'No description'}`;
+//   }).join('\n');
+// }
 
-/**
- * Match user intent to available prompts using LLM.
- * Returns { matched: true, prompt: string, args: object } or { matched: false }
- */
-async function matchPromptToIntent(userRequest, promptInventory, agentPrompts) {
-  if (!promptInventory?.length) {
-    return { matched: false };
-  }
-
-  const promptList = formatPromptsForMatching(promptInventory);
-
-  const matchPrompt = `WORKFLOW TEMPLATES:
-${promptList}
-
-USER REQUEST:
-${userRequest}
-
-OUTPUT: If a workflow template matches the user's intent, return JSON:
-{"matched": true, "prompt": "template-name", "args": {"arg1": "value1"}}
-
-If no template matches, return:
-{"matched": false}`;
-
-  try {
-    const response = await callOllama(
-      [
-        { role: 'system', content: agentPrompts.role_for_assistant },
-        { role: 'user', content: matchPrompt },
-      ],
-      [],
-      { options: { temperature: 0.3 }, silent: true },
-    );
-
-    const text = extractAssistantText(response.message).trim();
-    const result = JSON.parse(text);
-    if (result.matched && result.prompt) {
-      return { matched: true, prompt: result.prompt, args: result.args || {} };
-    }
-  } catch {
-    // Parse failed or LLM error, no match
-  }
-  return { matched: false };
-}
+// /**
+//  * Match user intent to available prompts using LLM.
+//  * Returns { matched: true, prompt: string, args: object } or { matched: false }
+//  */
+// async function matchPromptToIntent(userRequest, promptInventory, agentPrompts) {
+//   if (!promptInventory?.length) {
+//     return { matched: false };
+//   }
+//
+//   const promptList = formatPromptsForMatching(promptInventory);
+//
+//   const matchPrompt = `WORKFLOW TEMPLATES:
+// ${promptList}
+//
+// USER REQUEST:
+// ${userRequest}
+//
+// OUTPUT: If a workflow template matches the user's intent, return JSON:
+// {"matched": true, "prompt": "template-name", "args": {"arg1": "value1"}}
+//
+// If no template matches, return:
+// {"matched": false}`;
+//
+//   try {
+//     const response = await callOllama(
+//       [
+//         { role: 'system', content: agentPrompts.role_for_assistant },
+//         { role: 'user', content: matchPrompt },
+//       ],
+//       [],
+//       { options: { temperature: 0.3 }, spinnerMessage: 'Preflight: match' },
+//     );
+//
+//     const text = extractAssistantText(response.message).trim();
+//     const result = JSON.parse(text);
+//     if (result.matched && result.prompt) {
+//       return { matched: true, prompt: result.prompt, args: result.args || {} };
+//     }
+//   } catch {
+//     // Parse failed or LLM error, no match
+//   }
+//   return { matched: false };
+// }
 
 /**
  * Send the current conversation + tool definitions to Ollama's /api/chat endpoint.
@@ -579,7 +650,7 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
   const maxRetries = Math.max(1, config.maxRetries || 1);
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const { options: optionOverrides, silent, ...restOverrides } = overrides;
+      const { options: optionOverrides, silent, spinnerMessage, ...restOverrides } = overrides;
       const body = {
         model: config.model,
         messages,
@@ -623,7 +694,13 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
         fetchOptions.signal = signal;
       }
 
-      const response = await fetch(`${config.ollamaUrl}/api/chat`, fetchOptions);
+      startSpinner(spinnerMessage || 'Thinking');
+      let response;
+      try {
+        response = await fetch(`${config.ollamaUrl}/api/chat`, fetchOptions);
+      } finally {
+        stopSpinner();
+      }
 
       if (!response.ok) {
         const text = await response.text();
@@ -743,7 +820,7 @@ OUTPUT: JSON object with role_for_user and role_for_assistant fields.`,
       },
     ],
     [], // No tools - we just want a JSON response
-    { format: responseSchema },
+    { format: responseSchema, spinnerMessage: 'Initializing' },
   );
 
   const text = extractAssistantText(response.message);
@@ -982,6 +1059,7 @@ async function runPlanningQuery(planningMessages, toolInventory, temperature = 0
         // Allow string for "undefined" response, or array for tools
         options: { temperature },
         silent: true, // Prompt logged once before parallel queries
+        spinnerMessage: 'Planning: tools',
       },
     );
     clearTimeout(timeoutId);
@@ -1101,7 +1179,7 @@ OUTPUT: Return tool names as a JSON array in execution order, e.g. ["first_tool"
       { role: 'user', content: orderingPrompt },
     ],
     [],
-    { options: { temperature: 0.3 } },
+    { options: { temperature: 0.3 }, spinnerMessage: 'Planning: order' },
   );
 
   const text = extractAssistantText(response.message).trim();
@@ -1863,7 +1941,7 @@ async function runSequentialToolExecution(
           { role: 'user', content: focusedPrompt.user },
         ],
         [toolEntry.openAi],
-        { format: 'json' },
+        { format: 'json', spinnerMessage: `Step ${index + 1}: ${toolName}` },
       );
 
       const toolCalls = response.message?.tool_calls ?? [];
@@ -1952,7 +2030,7 @@ async function runSequentialToolExecution(
               { role: 'user', content: retryPrompt.user },
             ],
             [toolEntry.openAi],
-            { format: 'json' },
+            { format: 'json', spinnerMessage: `Step ${index + 1}: ${toolName} (retry)` },
           );
 
           const retryToolCalls = retryResponse.message?.tool_calls ?? [];
@@ -2038,7 +2116,7 @@ OUTPUT:`;
       { role: 'user', content: preflightPrompt },
     ],
     [],
-    { options: { temperature: 0.3 } },
+    { options: { temperature: 0.3 }, spinnerMessage: 'Preflight: expand' },
   );
 
   const expanded = extractAssistantText(response.message).trim();
@@ -2049,21 +2127,21 @@ OUTPUT:`;
     expandedRequest = expanded;
   }
 
-  // 2. Check for matching prompt template (always, for all queries)
-  const promptMatch = await matchPromptToIntent(expandedRequest, promptInventory, agentPrompts);
-  if (promptMatch.matched) {
-    agentLog(`[agent] Matched prompt template: ${promptMatch.prompt}`);
-    try {
-      const { messages } = await client.getPrompt(promptMatch.prompt, promptMatch.args);
-      promptGuidance = messages[0]?.content?.text || '';
-      if (promptGuidance) {
-        agentLog(`[agent] Prompt guidance: ${truncateText(promptGuidance, 100)}`);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      agentWarn(`[agent] Failed to get prompt: ${message}`);
-    }
-  }
+  // 2. Prompt template matching disabled for now
+  // const promptMatch = await matchPromptToIntent(expandedRequest, promptInventory, agentPrompts);
+  // if (promptMatch.matched) {
+  //   agentLog(`[agent] Matched prompt template: ${promptMatch.prompt}`);
+  //   try {
+  //     const { messages } = await client.getPrompt(promptMatch.prompt, promptMatch.args);
+  //     promptGuidance = messages[0]?.content?.text || '';
+  //     if (promptGuidance) {
+  //       agentLog(`[agent] Prompt guidance: ${truncateText(promptGuidance, 100)}`);
+  //     }
+  //   } catch (error) {
+  //     const message = error instanceof Error ? error.message : String(error);
+  //     agentWarn(`[agent] Failed to get prompt: ${message}`);
+  //   }
+  // }
 
   return { expandedRequest, promptGuidance };
 }
@@ -2124,6 +2202,7 @@ OUTPUT: Ask ONE short clarifying question to understand which tool(s) would help
       { role: 'user', content: userPrompt },
     ],
     [],
+    { spinnerMessage: 'Clarifying' },
   );
 
   const answer = extractAssistantText(response.message);
@@ -2284,6 +2363,7 @@ async function main() {
             { role: 'user', content: summaryPrompt },
           ],
           [],
+          { spinnerMessage: 'Finalizing' },
         );
         answer = extractAssistantText(summaryResponse.message);
       } else if (planningResult.needsAltIntro) {

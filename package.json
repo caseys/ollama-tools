@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node agent.js",
+    "debug": "DEBUG=1 node agent.js",
     "lint": "eslint .",
     "knip": "knip"
   },
