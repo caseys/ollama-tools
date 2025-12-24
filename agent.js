@@ -708,9 +708,8 @@ async function generateAgentPrompts(toolInventory, client) {
     required: ['role_for_user', 'role_for_assistant'],
   };
 
-  // Build a text summary of tools for the prompt (don't pass as callable tools)
-  // Tier 1 & 2 get name + description, others just names
-  const toolSummary = formatToolsByTier(toolInventory);
+  // Build a list of tool names for the prompt
+  const toolNames = toolInventory.map(t => t.openAi.function.name).join(', ');
 
   // Try to get status context from ksp://status resource
   let statusInfo = '';
@@ -733,24 +732,23 @@ async function generateAgentPrompts(toolInventory, client) {
     }
   }
 
-  const statusContext = statusInfo
-    ? `\nCurrent status from tools:\n${statusInfo}\n`
-    : '';
-
   const response = await callOllama(
     [
       {
         role: 'user',
-        content: `You are a helpful assistant with access to these tools:
+        content: `TOOLS: ${toolNames}
 
-${toolSummary}
-${statusContext}
-Based on these tools and status, write two 1-2 sentence summary of yourself in these forms:
+STATUS:
+${statusInfo || 'No status available.'}
+
+TASK: Write two 1-2 sentence summaries in these forms:
 
 {
   "role_for_user": "I can help [describe what you can accomplish with these TOOLS considering STATUS]...",
   "role_for_assistant": "You are a helpful assistant specializing in [describe what you can accomplish with these tools]..."
-}`,
+}
+
+OUTPUT: JSON object with role_for_user and role_for_assistant fields.`,
       },
     ],
     [], // No tools - we just want a JSON response
@@ -777,16 +775,6 @@ function getCommonTools(toolInventory) {
  */
 function getOtherTools(toolInventory) {
   return toolInventory.filter((t) => (t.tier ?? 2) > 2);
-}
-
-/**
- * Format common tools (tier 1+2) for planning prompts.
- */
-function formatCommonTools(toolInventory) {
-  const commonTools = getCommonTools(toolInventory);
-  return commonTools
-    .map((t) => `- ${t.openAi.function.name}: ${t.openAi.function.description || 'No description'}`)
-    .join('\n');
 }
 
 /**
@@ -2106,14 +2094,15 @@ async function runAltIntroProcess(
 
   // 2. Build the alt-intro prompt for the LLM
   const historySummary = summarizeHistory(history, HISTORY_MAX_PROMPTS);
-  const commonToolsText = formatCommonTools(toolInventory);
+  const commonToolNames = getCommonTools(toolInventory)
+    .map(t => t.openAi.function.name)
+    .join(', ');
 
   const altIntroPrompt = `${agentPrompts.role_for_assistant}
 
 The planning stage could not determine which tools to use for this request.
 
-COMMON TOOLS:
-${commonToolsText}
+TOOLS: ${commonToolNames}
 
 CONTEXT:
 ${statusInfo ? `Current status: ${statusInfo}` : 'No status available.'}

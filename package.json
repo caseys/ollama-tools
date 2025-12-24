@@ -18,8 +18,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.3",
     "dotenv": "^16.4.5",
-    "hear-say": "file:../hear-say",
-    "stemmer": "^2.0.1"
+    "hear-say": "file:../hear-say"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
