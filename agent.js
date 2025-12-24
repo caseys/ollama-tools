@@ -26,15 +26,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const MAX_SEQUENTIAL_PLAN_LENGTH = 6;
-const PLANNING_SYSTEM_PROMPT = `Select tools from TOOLS to fulfill the user request.
-
-RULES:
-1. Map user intent to tools (e.g., "go to X" → transfer tools, "fix orbit" → circularize).
-2. Pick the smallest set of tools needed.
-3. Use exact tool names - NO invented names.
-4. Return tools in execution order.
-5. Return empty array ONLY for greetings or questions.
-6. Do not repeat tools from HISTORY for the same purpose.`;
 
 const SINGLE_TOOL_RULES = `RULES:
 1. You MUST call the provided tool for this step.
@@ -1146,7 +1137,17 @@ function buildPlanningMessages(userPrompt, toolInventory, historySummary, agentP
     ? `\n\nWORKFLOW GUIDANCE:\n${promptGuidance}`
     : '';
 
-  const combinedPlanningPrompt = `${agentPrompts.role_for_assistant}\n\n${PLANNING_SYSTEM_PROMPT}`;
+  const combinedPlanningPrompt = `${agentPrompts.role_for_assistant}
+
+Select tools from TOOLS to fulfill the user request.
+
+RULES:
+1. Map user intent to tools (e.g., "go to X" → transfer tools, "fix orbit" → circularize).
+2. Pick the smallest set of tools needed.
+3. Use exact tool names - NO invented names.
+4. Return tools in execution order.
+5. Return empty array ONLY for greetings or questions.
+6. Do not repeat tools from HISTORY for the same purpose.`;
 
   return [
     {
