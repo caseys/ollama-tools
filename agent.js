@@ -69,6 +69,10 @@ function writeToLogFile(message) {
 // Debug mode flag (set after config is parsed)
 let debugMode = false;
 
+function describeError(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function colorize(message, color) {
   if (!ENABLE_COLOR || !color) {
     return message;
@@ -109,9 +113,9 @@ function separator(label = '') {
 }
 
 // Debug-only loggers (hidden in default mode)
-const toHumanLog = makeLogger('log', COLOR_CODES.toHuman, true);
-const toHumanWarn = makeLogger('warn', COLOR_CODES.warn, true);
-const toHumanError = makeLogger('error', COLOR_CODES.error, false); // errors always shown
+const agentLog = makeLogger('log', COLOR_CODES.toHuman, true);
+const agentWarn = makeLogger('warn', COLOR_CODES.warn, true);
+const agentError = makeLogger('error', COLOR_CODES.error, false); // errors always shown
 const fromLLMLog = makeLogger('log', COLOR_CODES.fromLLM, true);
 const toLLMLog = makeLogger('log', COLOR_CODES.toLLM, true);
 
@@ -119,97 +123,26 @@ const toLLMLog = makeLogger('log', COLOR_CODES.toLLM, true);
 const assistantLog = makeLogger('log', COLOR_CODES.fromLLM, false);
 
 // Tool loggers with dynamic tool name in label (debug-only)
-function toToolLog(toolName, message, ...rest) {
-  const label = `[toTool-${toolName}]`;
-  const formatted = `${label} ${message}`;
-  const fullMessage = rest.length > 0 ? `${formatted} ${rest.join(' ')}` : formatted;
-  writeToLogFile(fullMessage);
+function makeToolLogger(direction) {
+  const colorCode = direction === 'to' ? COLOR_CODES.toTool : COLOR_CODES.fromTool;
+  return function(toolName, message, ...rest) {
+    const label = `[${direction}Tool-${toolName}]`;
+    const formatted = `${label} ${message}`;
+    const fullMessage = rest.length > 0 ? `${formatted} ${rest.join(' ')}` : formatted;
+    writeToLogFile(fullMessage);
 
-  if (debugMode) {
-    if (rest.length > 0) {
-      console.log(colorize(formatted, COLOR_CODES.toTool), ...rest);
-    } else {
-      console.log(colorize(formatted, COLOR_CODES.toTool));
-    }
-  }
-}
-
-function fromToolLog(toolName, message, ...rest) {
-  const label = `[fromTool-${toolName}]`;
-  const formatted = `${label} ${message}`;
-  const fullMessage = rest.length > 0 ? `${formatted} ${rest.join(' ')}` : formatted;
-  writeToLogFile(fullMessage);
-
-  if (debugMode) {
-    if (rest.length > 0) {
-      console.log(colorize(formatted, COLOR_CODES.fromTool), ...rest);
-    } else {
-      console.log(colorize(formatted, COLOR_CODES.fromTool));
-    }
-  }
-}
-
-// Legacy aliases for gradual migration
-const agentLog = toHumanLog;
-const agentWarn = toHumanWarn;
-const agentError = toHumanError;
-
-// Module-level readline for confirmations (set by main)
-let confirmationRl;
-
-function setConfirmationReadline(rl) {
-  confirmationRl = rl;
-}
-
-// Confirmation handler - set during tool confirmation prompts
-let confirmationHandler;
-
-/**
- * Prompt user to confirm tool execution.
- * Accepts keyboard (y/n/Enter) or voice (yes/no).
- * Returns true if confirmed, false otherwise.
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function confirmToolExecution(_toolName, _arguments) {
-  if (!confirmationRl) {
-    // No readline available, auto-confirm
-    return true;
-  }
-
-  return new Promise((resolve) => {
-    let resolved = false;
-
-    const finalize = (confirmed) => {
-      if (resolved) return;
-      resolved = true;
-      confirmationHandler = undefined;
-      resolve(confirmed);
-    };
-
-    // Set up voice handler for yes/no
-    confirmationHandler = (text) => {
-      const lower = text.toLowerCase();
-      if (lower.includes('yes') || lower.includes('yeah') || lower.includes('yep') || lower.includes('proceed')) {
-        output.write('yes\n');
-        finalize(true);
-        return true; // Handled
-      } else if (lower.includes('no') || lower.includes('nope') || lower.includes('skip') || lower.includes('cancel')) {
-        output.write('no\n');
-        finalize(false);
-        return true; // Handled
+    if (debugMode) {
+      if (rest.length > 0) {
+        console.log(colorize(formatted, colorCode), ...rest);
+      } else {
+        console.log(colorize(formatted, colorCode));
       }
-      return false; // Not a yes/no response, ignore
-    };
-
-    // Also accept keyboard input
-    confirmationRl.question('Y/n> ').then((answer) => {
-      if (!resolved) {
-        const trimmed = answer.trim().toLowerCase();
-        finalize(trimmed === '' || trimmed === 'y' || trimmed === 'yes');
-      }
-    });
-  });
+    }
+  };
 }
+
+const toToolLog = makeToolLogger('to');
+const fromToolLog = makeToolLogger('from');
 
 // Voice I/O state
 let voiceBusy = true; // Start busy until ready
@@ -250,15 +183,6 @@ function initVoiceListener() {
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    // Check for confirmation mode first (yes/no prompts)
-    if (confirmationHandler) {
-      if (confirmationHandler(trimmed)) {
-        return; // Handled by confirmation
-      }
-      // Not a yes/no, ignore during confirmation
-      return;
-    }
-
     if (voiceBusy) {
       say("Hold on, I'm busy.");
       agentLog(`[voice] (ignored while busy) "${trimmed}"`);
@@ -278,9 +202,7 @@ const {
     transport,
     mcpBin,
     mcpHttpUrl,
-    maxIterations,
     maxRetries,
-    coreTools,
     toolTimeout,
     debug,
   },
@@ -308,17 +230,9 @@ const {
       type: 'string',
       default: process.env.MCP_HTTP_URL ?? 'http://127.0.0.1:3000/mcp',
     },
-    maxIterations: {
-      type: 'string',
-      default: process.env.MAX_ITERATIONS ?? '20',
-    },
     maxRetries: {
       type: 'string',
       default: process.env.MAX_RETRIES ?? '3',
-    },
-    coreTools: {
-      type: 'string',
-      default: process.env.CORE_TOOLS ?? '',
     },
     toolTimeout: {
       type: 'string',
@@ -353,9 +267,7 @@ const config = {
   transport: transport.toLowerCase(),
   mcpBin: resolveMcpBin(mcpBin),
   mcpHttpUrl,
-  maxIterations: parsePositiveInt(maxIterations, 20),
   maxRetries: parsePositiveInt(maxRetries, 3),
-  coreTools,
   toolTimeout: parsePositiveInt(toolTimeout, 600_000),
   debug: Boolean(debug),
 };
@@ -534,8 +446,7 @@ async function readResource(client, uri) {
     }
     return content.text;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    agentWarn(`[agent] Failed to read resource ${uri}: ${message}`);
+    agentWarn(`[agent] Failed to read resource ${uri}: ${describeError(error)}`);
     return;
   }
 }
@@ -576,6 +487,30 @@ function formatStatusResource(status) {
     }
   }
   return parts.join(', ');
+}
+
+/**
+ * Fetch and format status from ksp://status resource.
+ * Returns { statusInfo: string, error: string|null }
+ */
+async function fetchStatusInfo(client, logPrefix = '') {
+  if (!client) return { statusInfo: '', error: undefined };
+
+  const statusData = await readResource(client, 'ksp://status');
+  if (!statusData) {
+    agentLog(`[agent] ${logPrefix}status: readResource returned nothing`);
+    return { statusInfo: '', error: 'no data' };
+  }
+  if (statusData.error) {
+    agentLog(`[agent] ${logPrefix}status error: ${statusData.error}`);
+    return { statusInfo: '', error: statusData.error };
+  }
+
+  const statusInfo = formatStatusResource(statusData);
+  if (!statusInfo) {
+    agentLog(`[agent] ${logPrefix}status: formatStatusResource returned empty`);
+  }
+  return { statusInfo, error: undefined };
 }
 
 // Prompt template matching disabled for now
@@ -698,8 +633,9 @@ async function callOllamaWithSignal(messages, tools, signal, overrides = {}) {
       let response;
       try {
         response = await fetch(`${config.ollamaUrl}/api/chat`, fetchOptions);
-      } finally {
+      } catch (error) {
         stopSpinner();
+        throw error;
       }
 
       if (!response.ok) {
@@ -780,24 +716,10 @@ async function generateAgentPrompts(toolInventory, client) {
   const toolNames = toolInventory.map(t => t.openAi.function.name).join(', ');
 
   // Try to get status context from ksp://status resource
-  let statusInfo = '';
-  if (client) {
-    agentLog('[agent] Reading ksp://status resource for intro context...');
-    const statusData = await readResource(client, 'ksp://status');
-    if (statusData) {
-      if (statusData.error) {
-        agentLog(`[agent] Intro status error: ${statusData.error}`);
-      } else {
-        statusInfo = formatStatusResource(statusData);
-        if (statusInfo) {
-          agentLog(`[agent] Status: ${truncateText(statusInfo, 100)}`);
-        } else {
-          agentLog('[agent] Intro status: formatStatusResource returned empty');
-        }
-      }
-    } else {
-      agentLog('[agent] Intro status: readResource returned nothing');
-    }
+  agentLog('[agent] Reading ksp://status resource for intro context...');
+  const { statusInfo } = await fetchStatusInfo(client, 'Intro ');
+  if (statusInfo) {
+    agentLog(`[agent] Status: ${truncateMiddle(statusInfo, 100)}`);
   }
 
   const response = await callOllama(
@@ -825,7 +747,7 @@ OUTPUT: JSON object with role_for_user and role_for_assistant fields.`,
 
   const text = extractAssistantText(response.message);
   if (!text || text.trim() === '') {
-    toHumanLog('[toHuman] Debug - raw response:', JSON.stringify(response.message, undefined, 2));
+    agentLog('[agent] Debug - raw response:', JSON.stringify(response.message, undefined, 2));
     throw new Error('LLM returned empty response for agent prompts');
   }
   return JSON.parse(text);
@@ -849,8 +771,8 @@ function getOtherTools(toolInventory) {
  * Format tool list by tier - tier 1&2 get descriptions, others just names.
  */
 function formatToolsByTier(toolInventory) {
-  const tier1and2 = toolInventory.filter((t) => (t.tier ?? 2) <= 2);
-  const otherTools = toolInventory.filter((t) => (t.tier ?? 2) > 2);
+  const tier1and2 = getCommonTools(toolInventory);
+  const otherTools = getOtherTools(toolInventory);
 
   const lines = [];
 
@@ -1152,7 +1074,9 @@ function hasOrderDisagreement(toolResults, consensusTools) {
 }
 
 /**
- * Run an ordering query to resolve tool order when consensus disagrees on order.
+ * Specialized helper called by planToolSequence when consensus tools have
+ * different orderings across queries. Runs a single LLM query specifically
+ * to resolve the optimal execution order.
  */
 async function runOrderingQuery(consensusTools, userPrompt, toolInventory, agentPrompts) {
   const toolDescriptions = consensusTools.map(name => {
@@ -1239,6 +1163,11 @@ RULES:
   ];
 }
 
+/**
+ * Orchestrates tool sequence planning by running 3 parallel LLM queries
+ * at different temperatures (0.5, 0.8, 1.1) and computing consensus.
+ * Handles order disagreement detection by calling runOrderingQuery when needed.
+ */
 async function planToolSequence(userPrompt, toolInventory, historySummary = '', agentPrompts, promptGuidance = '', statusInfo = '') {
   agentLog('[agent] Planning tool sequence (consensus mode)...');
   if (!userPrompt || !userPrompt.trim()) {
@@ -1341,8 +1270,7 @@ async function planToolSequence(userPrompt, toolInventory, historySummary = '', 
 
     return { sequence: validSequence, needsAltIntro: validSequence.length === 0 };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    agentWarn(`[agent] Planning step failed: ${message}`);
+    agentWarn(`[agent] Planning step failed: ${describeError(error)}`);
     return { sequence: [], needsAltIntro: true };
   }
 }
@@ -1558,6 +1486,20 @@ function coercePrimitive(value) {
   return value;
 }
 
+function formatParameterHints(tool) {
+  const parameters = tool.parameters?.properties ?? {};
+  const required = tool.parameters?.required ?? [];
+
+  if (Object.keys(parameters).length === 0) return '';
+
+  return Object.entries(parameters).map(([key, schema]) => {
+    const requiredMark = required.includes(key) ? ' (required)' : '';
+    const type = schema.type || 'string';
+    const desc = schema.description ? ` - ${schema.description}` : '';
+    return `  - ${key}: ${type}${requiredMark}${desc}`;
+  }).join('\n');
+}
+
 function buildFocusedToolPrompt(
   userQuery,
   toolEntry,
@@ -1568,16 +1510,7 @@ function buildFocusedToolPrompt(
   agentPrompts,
 ) {
   const tool = toolEntry.openAi.function;
-  const parameters = tool.parameters?.properties ?? {};
-  const required = tool.parameters?.required ?? [];
-
-  // Build a simple parameter hint
-  const parameterHints = Object.entries(parameters).map(([key, schema]) => {
-    const request = required.includes(key) ? ' (required)' : '';
-    const type = schema.type || 'string';
-    const desc = schema.description ? ` - ${schema.description}` : '';
-    return `  - ${key}: ${type}${request}${desc}`;
-  }).join('\n');
+  const parameterHints = formatParameterHints(tool);
 
   // Build system message with role, rules, task, and tool info
   const systemLines = [
@@ -1629,15 +1562,7 @@ function buildToolRetryPrompt(
   agentPrompts,
 ) {
   const tool = toolEntry.openAi.function;
-  const parameters = tool.parameters?.properties ?? {};
-  const required = tool.parameters?.required ?? [];
-
-  const parameterHints = Object.entries(parameters).map(([key, schema]) => {
-    const request = required.includes(key) ? ' (required)' : '';
-    const type = schema.type || 'string';
-    const desc = schema.description ? ` - ${schema.description}` : '';
-    return `  - ${key}: ${type}${request}${desc}`;
-  }).join('\n');
+  const parameterHints = formatParameterHints(tool);
 
   // Build system message with role, rules, task, and tool info
   const systemLines = [
@@ -1716,7 +1641,7 @@ function summarizeHistory(history, limit) {
   for (const [index, entry] of toShow.entries()) {
     const absoluteIndex = history.length - toShow.length + index + 1;
     lines.push(
-      `${absoluteIndex}. ${truncateText(
+      `${absoluteIndex}. ${truncateMiddle(
         entry.prompt,
         HISTORY_PROMPT_TEXT_LIMIT,
       )}`,
@@ -1727,7 +1652,7 @@ function summarizeHistory(history, limit) {
           .join('; ')
       : 'none';
     lines.push(`   tools: ${toolText}`);
-    const finalSummary = truncateText(
+    const finalSummary = truncateMiddle(
       entry.finalSummary,
       HISTORY_RESULT_TEXT_LIMIT,
     );
@@ -1736,16 +1661,6 @@ function summarizeHistory(history, limit) {
     }
   }
   return lines.join('\n');
-}
-
-function truncateText(text, limit) {
-  if (!text) {
-    return '';
-  }
-  if (text.length <= limit) {
-    return text;
-  }
-  return `${text.slice(0, Math.max(0, limit - 3))}...`;
 }
 
 /**
@@ -1991,7 +1906,7 @@ async function runSequentialToolExecution(
         toolEvents.push({
           name: toolName,
           success,
-          summary: truncateText(textResult, HISTORY_EVENT_TEXT_LIMIT),
+          summary: truncateMiddle(textResult, HISTORY_EVENT_TEXT_LIMIT),
         });
 
         previousResult = { tool: toolName, result: textResult };
@@ -2006,7 +1921,7 @@ async function runSequentialToolExecution(
         }
         break; // Exit retry loop on successful call (even if tool reports failure)
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = describeError(error);
 
         if (toolAttempt < maxToolAttempts) {
           agentWarn(`[agent] Tool ${toolName} threw error: ${message}. Retrying...`);
@@ -2048,7 +1963,7 @@ async function runSequentialToolExecution(
         toolEvents.push({
           name: toolName,
           success: false,
-          summary: truncateText(message, HISTORY_EVENT_TEXT_LIMIT),
+          summary: truncateMiddle(message, HISTORY_EVENT_TEXT_LIMIT),
         });
       }
     }
@@ -2078,20 +1993,7 @@ async function runPreflightCheck(userRequest, previousAssistantResponse, toolInv
     .join(', ');
 
   // Get current status
-  let statusInfo = '';
-  const statusData = await readResource(client, 'ksp://status');
-  if (statusData) {
-    if (statusData.error) {
-      agentLog(`[agent] Preflight status error: ${statusData.error}`);
-    } else {
-      statusInfo = formatStatusResource(statusData);
-      if (!statusInfo) {
-        agentLog('[agent] Preflight status: formatStatusResource returned empty');
-      }
-    }
-  } else {
-    agentLog('[agent] Preflight status: readResource returned nothing');
-  }
+  const { statusInfo } = await fetchStatusInfo(client, 'Preflight ');
   const statusSection = statusInfo ? `\nSTATUS:\n${statusInfo}\n` : '';
 
   const preflightPrompt = `TOOLS: ${commonToolNames}
@@ -2135,7 +2037,7 @@ OUTPUT:`;
   //     const { messages } = await client.getPrompt(promptMatch.prompt, promptMatch.args);
   //     promptGuidance = messages[0]?.content?.text || '';
   //     if (promptGuidance) {
-  //       agentLog(`[agent] Prompt guidance: ${truncateText(promptGuidance, 100)}`);
+  //       agentLog(`[agent] Prompt guidance: ${truncateMiddle(promptGuidance, 100)}`);
   //     }
   //   } catch (error) {
   //     const message = error instanceof Error ? error.message : String(error);
@@ -2160,15 +2062,9 @@ async function runAltIntroProcess(
   agentLog('[agent] Running alt_intro process...');
 
   // 1. Try to get status from ksp://status resource
-  let statusInfo = '';
-  if (client) {
-    const statusData = await readResource(client, 'ksp://status');
-    if (statusData && !statusData.error) {
-      statusInfo = formatStatusResource(statusData);
-      if (statusInfo) {
-        agentLog(`[agent] Status: ${truncateText(statusInfo, 100)}`);
-      }
-    }
+  const { statusInfo } = await fetchStatusInfo(client, 'Alt-intro ');
+  if (statusInfo) {
+    agentLog(`[agent] Status: ${truncateMiddle(statusInfo, 100)}`);
   }
 
   // 2. Build the alt-intro prompt for the LLM
@@ -2231,7 +2127,6 @@ async function main() {
     input,
     output,
   });
-  setConfirmationReadline(rl);
 
   // Start continuous voice listener
   initVoiceListener();
@@ -2240,6 +2135,7 @@ async function main() {
   const commandHistory = [];
 
   // Show and speak the agent's role
+  stopSpinner();
   blankLine();
   assistantLog(agentPrompts.role_for_user);
   say(agentPrompts.role_for_user);
@@ -2315,11 +2211,7 @@ async function main() {
     );
 
     // Get current status for planning context
-    let statusInfo = '';
-    const statusData = await readResource(client, 'ksp://status');
-    if (statusData && !statusData.error) {
-      statusInfo = formatStatusResource(statusData);
-    }
+    const { statusInfo } = await fetchStatusInfo(client, 'Planning ');
 
     const historySummary = summarizeHistory(commandHistory, HISTORY_MAX_PROMPTS);
     const planningResult = await planToolSequence(
@@ -2380,6 +2272,7 @@ async function main() {
         answer = 'I could not determine which tools to use for your request. Please try rephrasing.';
       }
 
+      stopSpinner();
       blankLine();
       separator('ANSWER');
       assistantLog(answer);
@@ -2387,15 +2280,15 @@ async function main() {
       commandHistory.push({
         prompt: trimmedInput,
         toolEvents,
-        finalSummary: truncateText(
+        finalSummary: truncateMiddle(
           flattenWhitespace(answer),
           HISTORY_RESULT_TEXT_LIMIT,
         ),
         fullResponse: answer,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      agentError(`[agent] Failed to get answer: ${message}`);
+      stopSpinner();
+      agentError(`[agent] Failed to get answer: ${describeError(error)}`);
     }
     blankLine();
   }
