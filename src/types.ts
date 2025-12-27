@@ -141,7 +141,6 @@ export interface AgentPrompts {
 
 export interface PreflightResult {
   expandedRequest: string;
-  promptGuidance: string | undefined;
 }
 
 export interface ToolExecutionResult {

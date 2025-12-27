@@ -38,7 +38,7 @@ import {
 // Default pipeline configuration
 const defaultPipeline: PipelineStep[] = [
   // overlay/agent is used at startup
-  sttCorrectStep,  // Only runs for voice input
+  //sttCorrectStep,  // Only runs for voice input
   //preflightStep,
   planStep,
   executeStep,
@@ -128,8 +128,8 @@ async function main(): Promise<void> {
       statusInfo,
     };
 
-    // Only run preflight and plan for single-prompt mode
-    const planOnlyPipeline = [preflightStep, planStep];
+    // Only run plan for single-prompt mode
+    const planOnlyPipeline = [planStep];
     await runPipeline(planOnlyPipeline, ctx, pipelineDeps);
 
     loggers.agentLog(`[agent] Planning result: ${ctx.plannedTools?.length ?? 0} tools, branch=${ctx.branch}`);

@@ -23,7 +23,6 @@ export async function runPreflightCheck(
   deps: PreflightDeps
 ): Promise<PreflightResult> {
   let expandedRequest = userRequest;
-  const promptGuidance = undefined;
 
   deps.agentLog("[agent] Running preflight expansion...");
 
@@ -66,7 +65,7 @@ OUTPUT: Return ONLY the rewritten request as a plain English sentence.`;
     expandedRequest = expanded;
   }
 
-  return { expandedRequest, promptGuidance };
+  return { expandedRequest };
 }
 
 // --- Pipeline Step ---

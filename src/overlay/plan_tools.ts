@@ -26,23 +26,22 @@ function parsePlannedToolsResponse(
     availableNames.map((name) => [name.toLowerCase(), name])
   );
 
-  const jsonMatch = text.match(/\[[\s\S]*?\]/);
-  if (!jsonMatch) {
-    throw new Error(`Expected JSON array, got: ${text.slice(0, 100)}`);
-  }
+  const parsed: unknown = JSON.parse(text);
 
-  const parsed: unknown = JSON.parse(jsonMatch[0]);
-  if (!Array.isArray(parsed)) {
-    throw new Error(`Expected array, got: ${typeof parsed}`);
-  }
+  // Handle both array and object formats
+  const items: string[] = Array.isArray(parsed)
+    ? parsed.map(String)
+    : typeof parsed === "object" && parsed !== null
+      ? Object.keys(parsed)
+      : [];
 
-  if (parsed.length === 0) {
+  if (items.length === 0) {
     return { type: "empty" };
   }
 
   const tools: string[] = [];
-  for (const item of parsed) {
-    const match = findToolMatch(String(item).trim(), lowerNameMap);
+  for (const item of items) {
+    const match = findToolMatch(item.trim(), lowerNameMap);
     if (match && !tools.includes(match)) {
       tools.push(match);
     }
@@ -89,7 +88,7 @@ export interface PlanningDeps {
   toLLMLog: Logger;
 }
 
-const PLANNING_TEMPERATURES = [0.5, 0.8, 1.1];
+const PLANNING_TEMPERATURES = [0.7, 0.4, 1.0, 0.6, 0.8, 0.3, 0.9];
 
 async function runPlanningQuery(
   planningMessages: OllamaMessage[],
@@ -109,6 +108,7 @@ async function runPlanningQuery(
         options: { temperature },
         silent: true,
         spinnerMessage: "Planning: tools",
+        format: { type: "array", items: { type: "string" } },
       }
     );
     clearTimeout(timeoutId);
@@ -161,7 +161,7 @@ OUTPUT: Return tool names as a JSON array in execution order, e.g. ["first_tool"
       { role: "user", content: userPrompt },
     ],
     [],
-    { options: { temperature: 0.3 }, spinnerMessage: "Planning: order" }
+    { options: { temperature: 0.3 }, spinnerMessage: "Planning: order", format: { type: "array", items: { type: "string" } } }
   );
 
   const text = extractAssistantText(response.message).trim();
@@ -183,25 +183,25 @@ function buildPlanningMessages(
   toolInventory: InventoryEntry[],
   historySummary: string,
   agentPrompts: AgentPrompts,
-  promptGuidance = "",
   statusInfo = ""
 ): OllamaMessage[] {
-  const historySection = historySummary || "This is the initial prompt.";
-  const toolsText = formatToolsByTier(toolInventory);
+  const systemContent = `${agentPrompts.roleForAssistant}
 
-  const statusSection = statusInfo ? `\n\nSTATUS:\n${statusInfo}` : "";
-  const guidanceSection = promptGuidance
-    ? `\n\nWORKFLOW GUIDANCE:\n${promptGuidance}`
-    : "";
+TOOLS:
+${formatToolsByTier(toolInventory)}${statusInfo ? `
 
-  const combinedPlanningPrompt = `${agentPrompts.roleForAssistant}
+STATUS:
+${statusInfo}` : ""}
+
+HISTORY:
+${historySummary || "This is the initial prompt."}
 
 TASK: Select tools from TOOLS to fulfill the user request.
 
 RULES:
 1. Map user intent to tools (e.g., "go to X" → transfer tools, "fix orbit" → circularize).
 2. Replace invalid tool names with valid names from TOOLS to fix speech-to-text errors. NO invented names.
-3. Pick the smallest set of tools needed - since tools can be applied but not removed.
+3. Pick the SMALLEST set of tools needed - It's ALWAYS better to pick fewer tools.
 4. Return tools in execution order. using clues from user, tool descriptions, and your role experience.
 5. Return false if no tool request is found.
 6. Do not repeat tools from HISTORY for the same purpose.
@@ -209,14 +209,8 @@ RULES:
 OUTPUT: Return a JSON array of tool names, e.g. ["tool_name"] or ["first_tool", "second_tool"]`;
 
   return [
-    {
-      role: "system",
-      content: `${combinedPlanningPrompt}\n\nTOOLS:\n${toolsText}${statusSection}\n\nHISTORY:\n${historySection}${guidanceSection}`,
-    },
-    {
-      role: "user",
-      content: userPrompt,
-    },
+    { role: "system", content: systemContent },
+    { role: "user", content: userPrompt },
   ];
 }
 
@@ -226,7 +220,6 @@ export async function planToolSequence(
   historySummary: string,
   agentPrompts: AgentPrompts,
   deps: PlanningDeps,
-  promptGuidance = "",
   statusInfo = ""
 ): Promise<PlanResult> {
   deps.agentLog("[agent] Planning tool sequence (consensus + retry mode)...");
@@ -249,7 +242,6 @@ export async function planToolSequence(
     toolInventory,
     historySummary,
     agentPrompts,
-    promptGuidance,
     statusInfo
   );
 
@@ -284,7 +276,7 @@ export async function planToolSequence(
       toolResultsMatch,
       {
         maxQueries: PLANNING_TEMPERATURES.length,
-        minMatches: 2,
+        minMatches: 3,
         matchMode: "some",
         temperatures: PLANNING_TEMPERATURES,
       }
@@ -378,7 +370,6 @@ export const step: PipelineStep = createStep(
         agentWarn: deps.agentWarn,
         toLLMLog: deps.toLLMLog,
       },
-      "",
       ctx.statusInfo ?? ""
     );
     ctx.plannedTools = result.sequence;
