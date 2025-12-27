@@ -6,6 +6,21 @@ import type { OllamaClient } from "./ollama.js";
 import type { InventoryEntry } from "../utils/tools.js";
 import type { HistoryEntry } from "../utils/history.js";
 
+// Re-export utilities for steps to use
+export {
+  runWithRetry,
+  retryOnEmpty,
+  retryOnError,
+  type RetryConfig,
+} from "./retry.js";
+export {
+  runWithConsensus,
+  arraysOverlap,
+  arraysShareAtLeast,
+  type ConsensusConfig,
+  type ConsensusResult,
+} from "./consensus.js";
+
 // --- Pipeline Context ---
 
 export interface PipelineContext {

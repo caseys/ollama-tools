@@ -56,7 +56,6 @@ export interface ToolEvent {
 
 export interface PlanResult {
   sequence: string[];
-  needsAltIntro: boolean;
 }
 
 export interface McpConnection<TTransport = unknown, TToolInventory = unknown> {

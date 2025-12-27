@@ -9,7 +9,7 @@ import { extractAssistantText } from "../utils/strings.js";
 import { describeError } from "../ui/logger.js";
 import { findToolEntry, findToolMatch, getCommonTools, getOtherTools, formatToolsByTier } from "../utils/tools.js";
 import { summarizeHistory } from "../utils/history.js";
-import { createStep } from "../core/pipeline.js";
+import { createStep, retryOnEmpty, runWithConsensus } from "../core/pipeline.js";
 
 // --- Parser ---
 
@@ -51,13 +51,7 @@ function parsePlannedToolsResponse(
   return tools.length > 0 ? { type: "tools", tools } : { type: "empty" };
 }
 
-// --- Consensus ---
-
-interface ConsensusResult {
-  tools: string[];
-  emptyCount: number;
-  orderDisagreement: boolean;
-}
+// --- Consensus Helpers ---
 
 function hasOrderDisagreement(
   toolResults: string[][],
@@ -75,58 +69,14 @@ function hasOrderDisagreement(
   return orders.some((order) => order.join(",") !== firstOrder);
 }
 
-function computeConsensusTools(
-  results: ParsedToolsResult[],
-  threshold = 3
-): ConsensusResult {
-  const emptyCount = results.filter((r) => r.type === "empty").length;
-
-  const toolResults = results
-    .filter(
-      (r): r is ParsedToolsResult & { tools: string[] } =>
-        r.type === "tools" && r.tools !== undefined && r.tools.length > 0
-    )
-    .map((r) => r.tools);
-
-  if (toolResults.length === 0) {
-    return { tools: [], emptyCount, orderDisagreement: false };
-  }
-
-  const counts = new Map<string, number>();
-  for (const toolList of toolResults) {
-    for (const tool of toolList) {
-      counts.set(tool, (counts.get(tool) ?? 0) + 1);
-    }
-  }
-
-  const effectiveThreshold = Math.min(threshold, toolResults.length);
-  let consensusSet = [...counts.entries()]
-    .filter(([, count]) => count >= effectiveThreshold)
-    .map(([tool]) => tool);
-
-  if (consensusSet.length === 0 && effectiveThreshold > 2) {
-    consensusSet = [...counts.entries()]
-      .filter(([, count]) => count >= 2)
-      .map(([tool]) => tool);
-  }
-
-  let consensus: string[] = [];
-  if (consensusSet.length > 0) {
-    let bestResult: string[] = [];
-    let bestOverlap = 0;
-    for (const result of toolResults) {
-      const overlap = result.filter((t) => consensusSet.includes(t)).length;
-      if (overlap > bestOverlap) {
-        bestOverlap = overlap;
-        bestResult = result;
-      }
-    }
-    consensus = bestResult.filter((t) => consensusSet.includes(t));
-  }
-
-  const orderDisagreement = hasOrderDisagreement(toolResults, consensus);
-
-  return { tools: consensus, emptyCount, orderDisagreement };
+/**
+ * Compare two ParsedToolsResult for consensus.
+ * Returns true if they have overlapping tools.
+ */
+function toolResultsMatch(a: ParsedToolsResult, b: ParsedToolsResult): boolean {
+  if (a.type !== "tools" || b.type !== "tools") return false;
+  if (!a.tools?.length || !b.tools?.length) return false;
+  return a.tools.some((tool) => b.tools!.includes(tool));
 }
 
 // --- Planning ---
@@ -246,14 +196,14 @@ function buildPlanningMessages(
 
   const combinedPlanningPrompt = `${agentPrompts.roleForAssistant}
 
-Select tools from TOOLS to fulfill the user request.
+TASK: Select tools from TOOLS to fulfill the user request.
 
 RULES:
 1. Map user intent to tools (e.g., "go to X" → transfer tools, "fix orbit" → circularize).
-2. Pick the smallest set of tools needed.
-3. Use exact tool names - NO invented names.
-4. Return tools in execution order.
-5. Return empty array ONLY for greetings or questions.
+2. Replace invalid tool names with valid names from TOOLS to fix speech-to-text errors. NO invented names.
+3. Pick the smallest set of tools needed - since tools can be applied but not removed.
+4. Return tools in execution order. using clues from user, tool descriptions, and your role experience.
+5. Return false if no tool request is found.
 6. Do not repeat tools from HISTORY for the same purpose.
 
 OUTPUT: Return a JSON array of tool names, e.g. ["tool_name"] or ["first_tool", "second_tool"]`;
@@ -279,10 +229,10 @@ export async function planToolSequence(
   promptGuidance = "",
   statusInfo = ""
 ): Promise<PlanResult> {
-  deps.agentLog("[agent] Planning tool sequence (consensus mode)...");
+  deps.agentLog("[agent] Planning tool sequence (consensus + retry mode)...");
 
   if (!userPrompt.trim()) {
-    return { sequence: [], needsAltIntro: false };
+    return { sequence: [] };
   }
 
   const commonTools = getCommonTools(toolInventory);
@@ -313,52 +263,77 @@ export async function planToolSequence(
   }
 
   try {
-    deps.agentLog(
-      `[agent] Running ${PLANNING_TEMPERATURES.length} planning queries for consensus...`
+    deps.agentLog("[agent] Running consensus planning with retry on empty...");
+
+    // Run consensus with early exit, each query wrapped in retryOnEmpty
+    const consensusResult = await runWithConsensus<ParsedToolsResult>(
+      async (temperature) => {
+        const { result, attempts } = await retryOnEmpty(
+          () => runPlanningQuery(planningMessages, toolInventory, temperature, deps),
+          (r) => r === null || r.type === "empty",
+          {
+            maxAttempts: 3,
+            onRetry: (attempt) => { deps.agentLog(`[agent] Query retry ${attempt} (temp=${temperature})`); },
+          }
+        );
+        if (attempts > 1) {
+          deps.agentLog(`[agent] Query (temp=${temperature}) succeeded after ${attempts} attempts`);
+        }
+        return result;
+      },
+      toolResultsMatch,
+      {
+        maxQueries: PLANNING_TEMPERATURES.length,
+        minMatches: 2,
+        matchMode: "some",
+        temperatures: PLANNING_TEMPERATURES,
+      }
     );
 
-    const queryPromises = PLANNING_TEMPERATURES.map((temperature) =>
-      runPlanningQuery(planningMessages, toolInventory, temperature, deps)
-    );
-
-    const results = await Promise.all(queryPromises);
-
-    for (const [index, r] of results.entries()) {
+    // Log results
+    for (const [index, r] of consensusResult.allResults.entries()) {
       const toolsText =
         r.type === "tools" && r.tools && r.tools.length > 0
           ? r.tools.join(", ")
           : `(${r.type})`;
       deps.agentLog(
-        `[agent] Query ${index + 1} (temp=${PLANNING_TEMPERATURES[index]}): ${toolsText}`
+        `[agent] Query ${index + 1}: ${toolsText}`
       );
     }
 
-    const consensus = computeConsensusTools(results, PLANNING_TEMPERATURES.length);
+    deps.agentLog(
+      `[agent] Consensus: ${consensusResult.matchCount} matches from ${consensusResult.queriesRun} queries`
+    );
 
-    if (consensus.orderDisagreement && consensus.tools.length >= 2) {
+    // Extract tools from consensus result
+    let consensusTools: string[] = [];
+    if (consensusResult.result?.type === "tools" && consensusResult.result.tools) {
+      consensusTools = consensusResult.result.tools;
+    }
+
+    // Check for order disagreement among results with tools
+    const toolResults = consensusResult.allResults
+      .filter((r): r is ParsedToolsResult & { tools: string[] } =>
+        r.type === "tools" && r.tools !== undefined && r.tools.length > 0
+      )
+      .map((r) => r.tools);
+
+    if (hasOrderDisagreement(toolResults, consensusTools) && consensusTools.length >= 2) {
       const orderedTools = await runOrderingQuery(
-        consensus.tools,
+        consensusTools,
         userPrompt,
         toolInventory,
         agentPrompts,
         deps
       );
       deps.agentLog(`[agent] Ordered tools: ${orderedTools.join(" -> ")}`);
-      consensus.tools = orderedTools;
+      consensusTools = orderedTools;
     }
 
-    if (consensus.emptyCount >= 2) {
-      deps.agentLog(
-        "[agent] Planning consensus: no tools determined (2+ empty). Needs alt_intro."
-      );
-      return { sequence: [], needsAltIntro: true };
-    }
-
-    const sequence = consensus.tools;
-    deps.agentLog(`[agent] Consensus tools: ${sequence.join(", ") || "(none)"}`);
+    deps.agentLog(`[agent] Consensus tools: ${consensusTools.join(", ") || "(none)"}`);
 
     const seen = new Set<string>();
-    const validSequence = sequence.filter((name) => {
+    const validSequence = consensusTools.filter((name) => {
       if (seen.has(name)) return false;
       if (!findToolEntry(toolInventory, name)) return false;
       seen.add(name);
@@ -367,9 +342,9 @@ export async function planToolSequence(
 
     if (validSequence.length > MAX_SEQUENTIAL_PLAN_LENGTH) {
       deps.agentWarn(
-        `[agent] Planning returned ${validSequence.length} tools (exceeds limit of ${MAX_SEQUENTIAL_PLAN_LENGTH}). Needs alt_intro.`
+        `[agent] Planning returned ${validSequence.length} tools (exceeds limit of ${MAX_SEQUENTIAL_PLAN_LENGTH}).`
       );
-      return { sequence: [], needsAltIntro: true };
+      return { sequence: [] };
     }
 
     if (validSequence.length > 0) {
@@ -378,13 +353,10 @@ export async function planToolSequence(
       deps.agentLog("[agent] Planning step returned no tools.");
     }
 
-    return {
-      sequence: validSequence,
-      needsAltIntro: validSequence.length === 0,
-    };
+    return { sequence: validSequence };
   } catch (error) {
     deps.agentWarn(`[agent] Planning step failed: ${describeError(error)}`);
-    return { sequence: [], needsAltIntro: true };
+    return { sequence: [] };
   }
 }
 

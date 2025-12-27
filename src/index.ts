@@ -32,6 +32,7 @@ import {
   stopVoiceListener,
   setVoiceBusy,
   say,
+  enableSpeechInterrupt,
 } from "./ui/input.js";
 
 // Default pipeline configuration
@@ -141,6 +142,7 @@ async function main(): Promise<void> {
   blankLine(config.debug);
   loggers.assistantLog(agentPrompts.roleForUser);
   void say(agentPrompts.roleForUser);
+  enableSpeechInterrupt();
   blankLine(config.debug);
   loggers.agentLog('[agent] Type or speak a prompt (or "exit" to quit).');
 
@@ -220,6 +222,7 @@ async function main(): Promise<void> {
       separator(config.debug, "ANSWER");
       loggers.assistantLog(answer);
       void say(answer);
+      enableSpeechInterrupt();
 
       commandHistory.push({
         prompt: trimmedInput,

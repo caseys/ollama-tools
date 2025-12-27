@@ -27,13 +27,12 @@ ${toolNames}
 STATUS:
 ${statusInfo}
 
-TASK: Rewrite the user input as a complete, self-contained natural language request.
-- Replace invalid names with valid names from TOOLS or STATUS. User STT may mangle proper nouns.
-- NEVER return the CONTEXT itself.
+TASK: Corret the speech-to-text errors user input, STT may mangle tool names and argument values:
+- Replace invalid names/values with valid names from TOOLS or STATUS. 
 - NEVER return function calls or code - only plain English.
-- If the input is already complete, return it unchanged.
+- Make minimal changes. If the input is already complete, return it unchanged.
 
-OUTPUT: Return ONLY the rewritten request as a plain English sentence.`;
+OUTPUT: Return ONLY the user request with corrections.`;
 
   const response = await deps.ollamaClient.call(
     [
