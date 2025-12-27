@@ -34,6 +34,9 @@ export interface PipelineContext {
   plannedTools?: string[];
   toolResults?: ToolEvent[];
   response?: string;
+  stateSummary?: string;
+  reflectionStopped?: { reason: string };
+  reflectionQuestion?: string;
 
   // Shared resources
   toolInventory: InventoryEntry[];

@@ -8,29 +8,10 @@ export interface SummaryToolEvent {
   summary: string;
 }
 
-export function buildSummaryPrompt(
-  userQuery: string,
-  toolEvents: SummaryToolEvent[]
-): string {
-  const lines: string[] = ["USER REQUEST:", userQuery, "", "RESULTS:"];
-
-  for (const [index, event] of toolEvents.entries()) {
-    const status = event.success ? "✓" : "✗";
-    lines.push(`${index + 1}. ${event.name} ${status}: ${event.summary}`);
-  }
-
-  lines.push(
-    "",
-    "INSTRUCTIONS:",
-    "1. Summarize ONLY what the RESULTS show was accomplished.",
-    "2. Do NOT suggest actions or next steps not shown in RESULTS.",
-    "3. If a tool failed, report the error.",
-    "4. Ask what the user wants to do next.",
-    "",
-    "Keep response under 50 words."
-  );
-
-  return lines.join("\n");
+function formatToolResults(toolEvents: SummaryToolEvent[]): string {
+  return toolEvents
+    .map((e, i) => `${i + 1}. ${e.name} ${e.success ? "✓" : "✗"}: ${e.summary}`)
+    .join("\n");
 }
 
 // --- Pipeline Step ---
@@ -38,22 +19,61 @@ export function buildSummaryPrompt(
 export const step: PipelineStep = createStep(
   "summary",
   async (ctx: PipelineContext, deps: PipelineDeps): Promise<void> => {
+    // If reflection asked a question, use that directly
+    if (ctx.reflectionQuestion) {
+      ctx.response = ctx.reflectionQuestion;
+      ctx.stateSummary = "Awaiting user input.";
+      return;
+    }
+
     const toolEvents = (ctx.toolResults ?? []).map((e) => ({
       name: e.tool,
       success: e.status === "success",
       summary: e.result,
     }));
 
-    const summaryPrompt = buildSummaryPrompt(ctx.userInput, toolEvents);
-    const summarySystemPrompt = `${ctx.agentPrompts.roleForAssistant}\n\nSummarize what was accomplished based on the tool results.\n\n${summaryPrompt}`;
+    const resultsText = formatToolResults(toolEvents);
 
-    const response = await deps.ollamaClient.call(
-      [{ role: "system", content: summarySystemPrompt }],
+    // Include stop reason if reflection stopped execution
+    const stopContext = ctx.reflectionStopped
+      ? `\n\nSTOPPED: ${ctx.reflectionStopped.reason}`
+      : "";
+
+    // Generate user-facing response
+    const responsePrompt = `${ctx.agentPrompts.roleForAssistant}
+
+USER REQUEST:
+${ctx.userInput}
+
+RESULTS:
+${resultsText}${stopContext}
+
+TASK: Provide a brief response (2 sentences max):
+1. First sentence: summarize what was accomplished based on RESULTS only.${ctx.reflectionStopped ? " Explain why execution was stopped." : ""}
+2. Second sentence: ${ctx.reflectionStopped ? "Suggest what the user might do to address the issue." : 'encourage the user to continue (e.g., "What would you like to do next?").'}
+Do NOT suggest actions not shown in RESULTS. If a tool failed, report the error.`;
+
+    const responseResult = await deps.ollamaClient.call(
+      [{ role: "system", content: responsePrompt }],
       [],
-      { spinnerMessage: "Finalizing" }
+      { spinnerMessage: "Summarizing" }
     );
+    ctx.response = extractAssistantText(responseResult.message);
 
-    ctx.response = extractAssistantText(response.message);
+    // Generate concise state summary for history
+    const statePrompt = `RESULTS:
+${resultsText}${stopContext}
+
+TASK: Write ONE sentence describing the state changes from these results.
+Example: "File created at /path/to/file." or "Database updated with new record."
+Do NOT include encouragement or next steps. Just the factual state change.`;
+
+    const stateResult = await deps.ollamaClient.call(
+      [{ role: "system", content: statePrompt }],
+      [],
+      { spinnerMessage: "Recording" }
+    );
+    ctx.stateSummary = extractAssistantText(stateResult.message);
   },
   (ctx: PipelineContext): boolean =>
     ctx.branch === "execute" && (ctx.toolResults?.length ?? 0) > 0

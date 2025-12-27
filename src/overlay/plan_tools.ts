@@ -83,6 +83,7 @@ function toolResultsMatch(a: ParsedToolsResult, b: ParsedToolsResult): boolean {
 export interface PlanningDeps {
   config: Config;
   ollamaClient: OllamaClient;
+  spinner: { update: (message: string) => void };
   agentLog: Logger;
   agentWarn: Logger;
   toLLMLog: Logger;
@@ -258,8 +259,11 @@ export async function planToolSequence(
     deps.agentLog("[agent] Running consensus planning with retry on empty...");
 
     // Run consensus with early exit, each query wrapped in retryOnEmpty
+    let queryIndex = 0;
     const consensusResult = await runWithConsensus<ParsedToolsResult>(
       async (temperature) => {
+        queryIndex++;
+        deps.spinner.update(`Planning (${queryIndex})`);
         const { result, attempts } = await retryOnEmpty(
           () => runPlanningQuery(planningMessages, toolInventory, temperature, deps),
           (r) => r === null || r.type === "empty",
@@ -366,6 +370,7 @@ export const step: PipelineStep = createStep(
       {
         config: deps.config,
         ollamaClient: deps.ollamaClient,
+        spinner: deps.spinner,
         agentLog: deps.agentLog,
         agentWarn: deps.agentWarn,
         toLLMLog: deps.toLLMLog,
@@ -374,5 +379,11 @@ export const step: PipelineStep = createStep(
     );
     ctx.plannedTools = result.sequence;
     ctx.branch = result.sequence.length > 0 ? "execute" : "clarify";
+
+    if (ctx.plannedTools.length > 0) {
+      const toolsText = `Tools: ${ctx.plannedTools.join(" → ")}`;
+      console.log(toolsText);
+      deps.say(toolsText);
+    }
   }
 )

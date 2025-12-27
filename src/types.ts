@@ -139,12 +139,25 @@ export interface AgentPrompts {
   roleForAssistant: string;
 }
 
+export interface AgentPromptsLazy {
+  roleForUser: string;
+  roleForAssistantPromise: Promise<string>;
+}
+
 export interface PreflightResult {
   expandedRequest: string;
 }
 
 export interface ToolExecutionResult {
   toolEvents: ToolEvent[];
+  stopped?: { reason: string };
+  question?: string;
 }
+
+export type ReflectionDecision =
+  | { action: "continue" }
+  | { action: "stop"; reason: string }
+  | { action: "replan"; tools: string[]; reason: string }
+  | { action: "ask"; question: string };
 
 export type LogLevel = "debug" | "info" | "warn" | "error";

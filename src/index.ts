@@ -32,6 +32,7 @@ import {
   stopVoiceListener,
   setVoiceBusy,
   say,
+  raiseHand,
   enableSpeechInterrupt,
 } from "./ui/input.js";
 
@@ -49,7 +50,7 @@ const defaultPipeline: PipelineStep[] = [
 async function main(): Promise<void> {
   const { config, prompt: cliPrompt } = parseConfig();
   const loggers = createLoggers(config.debug);
-  const spinner = createSpinner(config.debug, loggers.agentLog);
+  const spinner = createSpinner(config.debug, loggers.agentLog, { say, raiseHand });
 
   const ollamaClient = createOllamaClient({
     config,
@@ -58,6 +59,8 @@ async function main(): Promise<void> {
     fromLLMLog: loggers.fromLLMLog,
     agentWarn: loggers.agentWarn,
   });
+
+  spinner.start("Loading");
 
   const { client, toolInventory, resourceInventory, promptInventory, transport } =
     await connectToMcp({
@@ -73,11 +76,20 @@ async function main(): Promise<void> {
   }
 
   loggers.agentLog("[agent] Generating agent prompts from tool catalog...");
-  const agentPrompts = await generateAgentPrompts(toolInventory, client, {
+  const { roleForUser, roleForAssistantPromise } = await generateAgentPrompts(toolInventory, client, {
     ollamaClient,
     agentLog: loggers.agentLog,
     agentWarn: loggers.agentWarn,
   });
+
+  // roleForAssistant resolves in background while user reads greeting
+  let agentPrompts: { roleForUser: string; roleForAssistant: string } | null = null;
+  const getAgentPrompts = async () => {
+    if (!agentPrompts) {
+      agentPrompts = { roleForUser, roleForAssistant: await roleForAssistantPromise };
+    }
+    return agentPrompts;
+  };
 
   const rl = readline.createInterface({ input, output });
 
@@ -121,9 +133,9 @@ async function main(): Promise<void> {
 
     const ctx: PipelineContext = {
       userInput: cliPrompt,
-      previousResponse: agentPrompts.roleForUser,
+      previousResponse: roleForUser,
       toolInventory,
-      agentPrompts,
+      agentPrompts: await getAgentPrompts(),
       history: [],
       statusInfo,
     };
@@ -140,8 +152,8 @@ async function main(): Promise<void> {
   // Interactive mode
   spinner.stop();
   blankLine(config.debug);
-  loggers.assistantLog(agentPrompts.roleForUser);
-  void say(agentPrompts.roleForUser);
+  loggers.assistantLog(roleForUser);
+  void say(roleForUser);
   enableSpeechInterrupt();
   blankLine(config.debug);
   loggers.agentLog('[agent] Type or speak a prompt (or "exit" to quit).');
@@ -185,7 +197,7 @@ async function main(): Promise<void> {
     const lastEntry = commandHistory.at(-1);
     const previousResponse = lastEntry?.fullResponse
       ? truncateMiddle(lastEntry.fullResponse, 1000)
-      : agentPrompts.roleForUser;
+      : roleForUser;
 
     const { statusInfo } = await fetchStatusInfo(
       client,
@@ -198,7 +210,7 @@ async function main(): Promise<void> {
       previousResponse,
       inputSource,
       toolInventory,
-      agentPrompts,
+      agentPrompts: await getAgentPrompts(),
       history: commandHistory,
       statusInfo,
     };
@@ -207,13 +219,6 @@ async function main(): Promise<void> {
       // Run the full pipeline
       await runPipeline(defaultPipeline, ctx, pipelineDeps);
       blankLine(config.debug);
-
-      if (ctx.branch === "execute" && ctx.plannedTools && ctx.plannedTools.length > 0) {
-        separator(config.debug, "EXECUTION");
-        loggers.agentLog(
-          `Ran ${ctx.plannedTools.length} tools: ${ctx.plannedTools.join(" → ")}`
-        );
-      }
 
       const answer = ctx.response ?? "I could not determine which tools to use for your request. Please try rephrasing.";
 
@@ -231,7 +236,7 @@ async function main(): Promise<void> {
           success: e.status === "success",
         })),
         finalSummary: truncateMiddle(
-          flattenWhitespace(answer),
+          flattenWhitespace(ctx.stateSummary ?? answer),
           HISTORY_RESULT_TEXT_LIMIT
         ),
         fullResponse: answer,

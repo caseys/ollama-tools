@@ -3,22 +3,32 @@ import { SPINNER_FRAMES } from "../config/constants.js";
 import type { Logger } from "./logger.js";
 
 export interface Spinner {
-  start: (message?: string) => void;
+  start: (message: string) => void;
   stop: () => void;
   update: (message: string) => void;
 }
 
-export function createSpinner(debugMode: boolean, agentLog: Logger): Spinner {
+export interface SpinnerDeps {
+  say?: (text: string) => void;
+  raiseHand?: (text: string) => void;
+}
+
+export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: SpinnerDeps): Spinner {
   let spinnerInterval: ReturnType<typeof setInterval> | undefined;
   let spinnerIndex = 0;
+  let currentMessage = "";
 
-  function start(message = "Thinking"): void {
+  function start(message: string): void {
+    if (message !== currentMessage) {
+      currentMessage = message;
+      deps?.say?.(message);
+    }
     if (debugMode) return;
     stop();
     spinnerIndex = 0;
     spinnerInterval = setInterval(() => {
       const frame = SPINNER_FRAMES[spinnerIndex++ % SPINNER_FRAMES.length];
-      process.stdout.write(`\r${frame} ${message}...`);
+      process.stdout.write(`\r${frame} ${currentMessage}...`);
     }, 80);
   }
 
@@ -31,6 +41,10 @@ export function createSpinner(debugMode: boolean, agentLog: Logger): Spinner {
   }
 
   function update(message: string): void {
+    if (message !== currentMessage) {
+      currentMessage = message;
+      deps?.raiseHand?.(message);
+    }
     if (spinnerInterval && !debugMode) {
       const frame = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length];
       process.stdout.write(`\r\u001B[K${frame} ${message}`);

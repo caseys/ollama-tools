@@ -1,11 +1,4 @@
 export const MAX_SEQUENTIAL_PLAN_LENGTH = 6;
-
-export const SINGLE_TOOL_RULES = `RULES:
-1. You MUST call the provided tool for this step.
-2. Extract argument values from the user's request.
-3. Prefer empty arguments unless the user specifies arguments.
-4. Do not make up argument values.`;
-
 export const HISTORY_MAX_PROMPTS = 5;
 export const HISTORY_PROMPT_TEXT_LIMIT = 140;
 export const HISTORY_RESULT_TEXT_LIMIT = 160;

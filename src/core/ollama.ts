@@ -95,7 +95,9 @@ export function createOllamaClient(deps: OllamaClientDeps): OllamaClient {
           fetchOptions.signal = signal;
         }
 
-        spinner.start(spinnerMessage ?? "Thinking");
+        if (!silent && spinnerMessage) {
+          spinner.start(spinnerMessage);
+        }
         let response: Response;
         try {
           response = await fetch(`${config.ollamaUrl}/api/chat`, fetchOptions);

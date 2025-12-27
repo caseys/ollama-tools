@@ -1,6 +1,6 @@
 import type { Interface as ReadlineInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { hear, say } from "hear-say";
+import { hear, say, raiseHand } from "hear-say";
 import type { InputResult } from "../types.js";
 import type { Logger } from "./logger.js";
 
@@ -106,4 +106,4 @@ export function disableSpeechInterrupt(): void {
   }
 }
 
-export { say };
+export { say, raiseHand };
