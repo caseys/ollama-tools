@@ -17,6 +17,7 @@ import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { randomUUID } from 'node:crypto';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -294,6 +295,14 @@ function stopSpinner() {
     clearInterval(spinnerInterval);
     spinnerInterval = undefined;
     process.stdout.write('\r\u001B[K'); // Clear line
+  }
+}
+
+function updateSpinner(message) {
+  if (spinnerInterval && !debugMode) {
+    process.stdout.write(`\r\u001B[K${SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length]} ${message}`);
+  } else if (debugMode) {
+    agentLog(`[Progress] ${message}`);
   }
 }
 
@@ -1085,22 +1094,20 @@ async function runOrderingQuery(consensusTools, userPrompt, toolInventory, agent
     return `- ${name}: ${desc}`;
   }).join('\n');
 
-  const orderingPrompt = `TASK: Order these tools to fulfill the user's request.
+  const orderingSystem = `${agentPrompts.role_for_assistant}
+
+TASK: Order these tools to fulfill the user's request.
 
 TOOLS TO ORDER:
-${toolDescriptions}
-
-USER REQUEST:
-${userPrompt}
-
-OUTPUT: Return tool names as a JSON array in execution order, e.g. ["first_tool", "second_tool"]`;
+${toolDescriptions}`;
 
   agentLog('[agent] Running ordering query to resolve order disagreement...');
 
   const response = await callOllama(
     [
-      { role: 'system', content: agentPrompts.role_for_assistant },
-      { role: 'user', content: orderingPrompt },
+      { role: 'system', content: orderingSystem },
+      { role: 'user', content: userPrompt },
+      { role: 'system', content: 'OUTPUT: Return tool names as a JSON array in execution order, e.g. ["first_tool", "second_tool"]' },
     ],
     [],
     { options: { temperature: 0.3 }, spinnerMessage: 'Planning: order' },
@@ -1154,11 +1161,15 @@ RULES:
   return [
     {
       role: 'system',
-      content: combinedPlanningPrompt,
+      content: `${combinedPlanningPrompt}\n\nTOOLS:\n${toolsText}${statusSection}\n\nHISTORY:\n${historySection}${guidanceSection}`,
     },
     {
       role: 'user',
-      content: `TOOLS:\n${toolsText}${statusSection}\n\nHISTORY:\n${historySection}${guidanceSection}\n\nUSER REQUEST:\n${userPrompt}\n\nOUTPUT: ["tool_name"] or ["first_tool", "second_tool"]`,
+      content: userPrompt,
+    },
+    {
+      role: 'system',
+      content: 'OUTPUT: ["tool_name"] or ["first_tool", "second_tool"]',
     },
   ];
 }
@@ -1885,12 +1896,18 @@ async function runSequentialToolExecution(
       toToolLog(toolName, Object.keys(arguments_).length > 0 ? JSON.stringify(arguments_) : '(no args)');
 
       try {
+        const progressToken = randomUUID();
         const result = await client.callTool(
-          { name: toolName, arguments: arguments_ },
+          { name: toolName, arguments: arguments_, _meta: { progressToken } },
           undefined,
           {
             timeout: config.toolTimeout,
             resetTimeoutOnProgress: true,
+            onprogress: (progress) => {
+              if (progress.message) {
+                updateSpinner(progress.message);
+              }
+            },
           }
         );
         const textResult = formatMcpResult(result);
@@ -1996,7 +2013,9 @@ async function runPreflightCheck(userRequest, previousAssistantResponse, toolInv
   const { statusInfo } = await fetchStatusInfo(client, 'Preflight ');
   const statusSection = statusInfo ? `\nSTATUS:\n${statusInfo}\n` : '';
 
-  const preflightPrompt = `TOOLS: ${commonToolNames}
+  const preflightSystem = `${agentPrompts.role_for_assistant}
+
+TOOLS: ${commonToolNames}
 ${statusSection}
 CONTEXT (for reference only):
 ${previousAssistantResponse}
@@ -2005,17 +2024,13 @@ TASK: Rewrite the user input as a complete, self-contained request.
 - If the input references the context (e.g., "yes", "do it", "the first one"), incorporate the relevant details.
 - If the input is already complete, return it unchanged.
 - Replace invalid names with valid names from TOOLS or STATUS. User STT may mangle proper nouns.
-- NEVER return the CONTEXT itself.
-
-USER INPUT:
-${userRequest}
-
-OUTPUT:`;
+- NEVER return the CONTEXT itself.`;
 
   const response = await callOllama(
     [
-      { role: 'system', content: agentPrompts.role_for_assistant },
-      { role: 'user', content: preflightPrompt },
+      { role: 'system', content: preflightSystem },
+      { role: 'user', content: userRequest },
+      { role: 'system', content: 'OUTPUT:' },
     ],
     [],
     { options: { temperature: 0.3 }, spinnerMessage: 'Preflight: expand' },
@@ -2248,11 +2263,10 @@ async function main() {
 
         // Final summary call - include mission context from Intro
         const summaryPrompt = buildSummaryPrompt(trimmedInput, toolEvents);
-        const summarySystemPrompt = `${agentPrompts.role_for_assistant}\n\nSummarize what was accomplished based on the tool results.`;
+        const summarySystemPrompt = `${agentPrompts.role_for_assistant}\n\nSummarize what was accomplished based on the tool results.\n\n${summaryPrompt}`;
         const summaryResponse = await callOllama(
           [
             { role: 'system', content: summarySystemPrompt },
-            { role: 'user', content: summaryPrompt },
           ],
           [],
           { spinnerMessage: 'Finalizing' },
