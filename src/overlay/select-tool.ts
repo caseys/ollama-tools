@@ -80,14 +80,12 @@ function toolsMatch(a: string | undefined, b: string | undefined): boolean {
 function formatPreviousResults(toolResults: ToolEvent[]): string {
   if (toolResults.length === 0) return "";
 
-  const lines = toolResults.map((e, i) => {
+  const entries = toolResults.map((e, i) => {
     const statusIcon = e.success ? "\u2713" : "\u2717";
-    const firstLine = e.result.split("\n")[0] ?? "";
-    return `${i + 1}. ${e.toolName} ${statusIcon}: ${firstLine}`;
+    return `${i + 1}. ${e.toolName} ${statusIcon}:\n${e.result}`;
   });
 
-  return `\nPREVIOUS RESULTS (this session):
-${lines.join("\n")}`;
+  return `\nPREVIOUS RESULTS (this session):\n${entries.join("\n\n")}`;
 }
 
 function buildSelectToolPrompt(
@@ -181,18 +179,26 @@ async function runSelectionQuery(
   }
 }
 
+// === Result Type ===
+
+export interface SelectToolResult {
+  tool: string | undefined;
+  consensusCount: number;
+  queriesRun: number;
+}
+
 // === Main Function ===
 
 export async function selectTool(
   state: TurnWorkingState,
   input: TurnInput,
   deps: SelectToolDeps
-): Promise<string | undefined> {
+): Promise<SelectToolResult> {
   deps.agentLog(`[select] Iteration ${state.iteration}/${state.maxIterations}`);
 
   if (!state.remainingQuery.trim()) {
     deps.agentLog("[select] Empty remaining query, returning undefined");
-    return undefined;
+    return { tool: undefined, consensusCount: 0, queriesRun: 0 };
   }
 
   // Fetch current status
@@ -249,5 +255,9 @@ export async function selectTool(
   const selectedTool = consensusResult.result;
   deps.agentLog(`[select] Selected: ${selectedTool ?? "(none)"}`);
 
-  return selectedTool;
+  return {
+    tool: selectedTool,
+    consensusCount: consensusResult.matchCount,
+    queriesRun: consensusResult.queriesRun,
+  };
 }

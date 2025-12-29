@@ -59,6 +59,13 @@ export interface TurnWorkingState {
   currentTool: string | undefined;
   groupToolResults: ToolEvent[];
   reminders: Reminder[];
+
+  // Tool selection consensus (set by SELECT_TOOL, read by REFLECT)
+  lastToolSelectionResult?: {
+    selectedTool: string | undefined;
+    consensusCount: number;
+    queriesRun: number;
+  };
 }
 
 // === Output Types ===

@@ -103,7 +103,7 @@ export async function runTurn(
         }
 
         // Select the next tool
-        const selectedTool = await selectTool(state, input, {
+        const selectionResult = await selectTool(state, input, {
           config: deps.config,
           client: deps.client,
           ollamaClient: deps.ollamaClient,
@@ -116,15 +116,20 @@ export async function runTurn(
           toLLMLog: deps.toLLMLog,
         });
 
-        state.currentTool = selectedTool;
+        state.currentTool = selectionResult.tool;
+        state.lastToolSelectionResult = {
+          selectedTool: selectionResult.tool,
+          consensusCount: selectionResult.consensusCount,
+          queriesRun: selectionResult.queriesRun,
+        };
 
-        if (selectedTool) {
-          deps.agentLog(`[machine] Selected: ${selectedTool}`);
-          console.log(`Tool: ${selectedTool}`);
-          deps.say(`Tool: ${selectedTool}`);
+        if (selectionResult.tool) {
+          deps.agentLog(`[machine] Selected: ${selectionResult.tool}`);
+          console.log(`Tool: ${selectionResult.tool}`);
+          deps.say(`Tool: ${selectionResult.tool}`);
           machineState = MachineState.EXECUTE;
         } else {
-          deps.agentLog("[machine] No tool selected, moving to reflect");
+          deps.agentLog(`[machine] No tool selected (${selectionResult.consensusCount}/${selectionResult.queriesRun} consensus), moving to reflect`);
           machineState = MachineState.REFLECT_SUMMARIZE;
         }
         break;

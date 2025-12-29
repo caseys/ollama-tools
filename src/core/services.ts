@@ -135,7 +135,15 @@ export async function callMcpTool(
   const textResult = formatMcpResult(result);
   const success = didToolSucceed(result);
 
-  loggers.fromToolLog(toolName, textResult.split("\n")[0] ?? "");
+  // Log the result - show full details for errors, first line for success
+  if (success) {
+    loggers.fromToolLog(toolName, textResult.split("\n")[0] ?? "");
+  } else {
+    // For errors, log each line to show full error details
+    for (const line of textResult.split("\n").filter(l => l.trim())) {
+      loggers.fromToolLog(toolName, line);
+    }
+  }
 
   // Build the event
   const event: ToolEvent = {

@@ -183,7 +183,7 @@ export async function executeTool(
     deps.say(firstLine);
 
     if (!event.success) {
-      deps.agentError(`[execute] Tool ${toolName} failed`);
+      deps.agentError(`[execute] Tool ${toolName} failed: ${event.result.split("\n").slice(0, 3).join(" | ")}`);
     }
 
     return event;
