@@ -3,11 +3,13 @@
  * Supports early exit once sufficient agreement is reached.
  */
 
+import { getSamplingParams, type SamplingParams } from "./retry.js";
+
 export interface ConsensusConfig {
   maxQueries: number;
   minMatches: number;
   matchMode: "exact" | "some";
-  temperatures?: number[];
+  stop?: string[];
 }
 
 export interface ConsensusResult<T> {
@@ -21,7 +23,6 @@ const DEFAULT_CONFIG: ConsensusConfig = {
   maxQueries: 3,
   minMatches: 2,
   matchMode: "some",
-  temperatures: [0.5, 0.8, 1.1],
 };
 
 /**
@@ -86,7 +87,7 @@ function findBestCandidate<T>(
 /**
  * Run queries with consensus, supporting early exit.
  *
- * @param queryFn - Function to run a query at a given temperature
+ * @param queryFn - Function to run a query with sampling params
  * @param compareFn - Function to compare two results (for "some" mode, return true if they partially match)
  * @param config - Consensus configuration
  *
@@ -94,19 +95,14 @@ function findBestCandidate<T>(
  * For matchMode "some", compareFn should return true if results have sufficient overlap.
  */
 export async function runWithConsensus<T>(
-  queryFn: (temperature: number) => Promise<T | null>,
+  queryFn: (params: SamplingParams) => Promise<T | null>,
   compareFn: (a: T, b: T) => boolean,
   config: Partial<ConsensusConfig> = {}
 ): Promise<ConsensusResult<T>> {
-  const { maxQueries, minMatches, matchMode, temperatures } = {
+  const { maxQueries, minMatches, matchMode, stop } = {
     ...DEFAULT_CONFIG,
     ...config,
   };
-
-  const effectiveTemps =
-    temperatures && temperatures.length >= maxQueries
-      ? temperatures.slice(0, maxQueries)
-      : DEFAULT_CONFIG.temperatures!.slice(0, maxQueries);
 
   const compare: (a: T, b: T) => boolean =
     matchMode === "exact" ? deepEqual : compareFn;
@@ -114,9 +110,10 @@ export async function runWithConsensus<T>(
   const results: T[] = [];
   let queriesRun = 0;
 
-  for (const temp of effectiveTemps) {
+  for (let i = 0; i < maxQueries; i++) {
     queriesRun++;
-    const result = await queryFn(temp);
+    const params = getSamplingParams(i, stop);
+    const result = await queryFn(params);
 
     if (result !== null) {
       results.push(result);
@@ -132,9 +129,6 @@ export async function runWithConsensus<T>(
         };
       }
     }
-
-    // Stop if we've run all queries
-    if (queriesRun >= maxQueries) break;
   }
 
   // No early consensus - find best result from all

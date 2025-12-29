@@ -2,6 +2,37 @@
  * Generic retry utilities for pipeline steps.
  */
 
+// === Sampling Parameters ===
+
+export interface SamplingParams {
+  temperature: number;
+  top_p: number;
+  top_k: number;
+  stop?: string[];
+}
+
+const RETRY_TEMPS = [0.4, 0.2, 0.6, 0.3, 0.5, 0.1];
+const RETRY_TOP_P = [0.8, 0.82, 0.84, 0.86, 0.88, 0.9];
+const RETRY_TOP_K = [20, 24, 28, 32, 36, 40];
+
+/**
+ * Get sampling params for a given attempt index.
+ * Parameters progressively open up: temp oscillates, top_p/top_k increase.
+ */
+export function getSamplingParams(attempt: number, stop?: string[]): SamplingParams {
+  const params: SamplingParams = {
+    temperature: RETRY_TEMPS[attempt % RETRY_TEMPS.length] ?? 0.4,
+    top_p: RETRY_TOP_P[attempt % RETRY_TOP_P.length] ?? 0.8,
+    top_k: RETRY_TOP_K[attempt % RETRY_TOP_K.length] ?? 20,
+  };
+  if (stop) {
+    params.stop = stop;
+  }
+  return params;
+}
+
+// === Basic Retry ===
+
 export interface RetryConfig {
   maxAttempts: number;
   delayMs?: number;
@@ -97,4 +128,46 @@ export async function retryOnError<T>(
     result.error = lastError;
   }
   return result;
+}
+
+// === Sampling-params-varying retry ===
+
+export interface RetryWithParamsConfig {
+  maxAttempts?: number;
+  stop?: string[];
+  onRetry?: (attempt: number) => void;
+}
+
+/**
+ * Retry with varying sampling params on each attempt.
+ * Temperature oscillates, top_p/top_k progressively increase.
+ */
+export async function retryWithVaryingParams<T>(
+  fn: (params: SamplingParams) => Promise<T | undefined>,
+  isEmpty: (result: T | undefined) => boolean,
+  config: RetryWithParamsConfig = {}
+): Promise<{ result: T | undefined; attempts: number; params: SamplingParams }> {
+  const { maxAttempts = 3, stop, onRetry } = config;
+
+  let attempts = 0;
+  let lastResult: T | undefined;
+  let lastParams = getSamplingParams(0, stop);
+
+  while (attempts < maxAttempts) {
+    const params = getSamplingParams(attempts, stop);
+    lastParams = params;
+    attempts++;
+
+    lastResult = await fn(params);
+
+    if (!isEmpty(lastResult)) {
+      return { result: lastResult, attempts, params };
+    }
+
+    if (attempts < maxAttempts) {
+      onRetry?.(attempts);
+    }
+  }
+
+  return { result: lastResult, attempts, params: lastParams };
 }

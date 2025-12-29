@@ -1,378 +1,147 @@
-# Code Review: ollama-tools
+# State Machine Refactor Implementation Plan
 
-## Summary
+## Overview
+Refactor the ollama-tools pipeline from sequential step execution to a state machine with single-tool selection per iteration.
 
-This is a well-designed, minimal (~800 lines) single-file agent that bridges Ollama LLMs with MCP tools. The architecture is clean and the code is readable. Below are observations organized by category with specific recommendations.
+**Target Flow:** WAIT_USER → SELECT_TOOL → EXECUTE → REFLECT/SUMMARIZE → (loop or done)
 
----
+## Key Concept: Iteration Groups
 
-## Strengths
+When a user query requires multiple tools, those iterations form an **iteration group**:
+- Iteration number starts at 1 and increments within the group
+- Planning and reflect steps prioritize tool results from the current group
+- Reflect step creates a **remaining query** (original minus completed work)
+- Original user query is preserved separately from the working query
+- When original query is satisfied, the group ends and iteration resets to 0
+- History entries track which group they belong to
 
-1. **Minimal dependencies** - Only `@modelcontextprotocol/sdk` needed (zod comes with it)
-2. **Transport-agnostic** - stdio/HTTP abstraction is clean
-3. **Smart context management** - History summarization prevents context explosion
-4. **Auto-retry via reminders** - Clever pattern to keep model self-correcting
-5. **Type coercion** - Handles Ollama's string-ification of booleans/numbers
-6. **Clean shutdown** - Proper SIGINT handling
+## New Files to Create
 
----
+### 1. `src/core/turn-types.ts` (~100 lines)
+Type definitions for the new architecture:
+```typescript
+interface TurnInput { userInput, previousResponse, inputSource }
 
-## Issues & Recommendations
-
-### 1. Unused Dependency
-**File:** `package.json:18`
-
-`zod` is listed but never imported or used in `agent.js`. Either remove it or use it for runtime schema validation.
-
-**Recommendation:** Remove from dependencies unless you plan to add schema validation.
-
----
-
-### 2. KSP-Specific Hardcoding
-**File:** `agent.js:35-43`
-
-```javascript
-const ALWAYS_INCLUDE_TOOLS = [
-  'kos_status',
-  'kos_connect',
-  // ... all KSP-specific
-];
-```
-
-This limits generalization to other MCP servers.
-
-**Recommendation:** Make this configurable:
-```javascript
-// Via CLI/env:
---alwaysIncludeTools "tool1,tool2,tool3"
-// Or discover "core" tools via a naming convention or metadata
-```
-
----
-
-### 3. No Token/Context Limit Awareness
-**File:** `agent.js:270-294`
-
-The conversation grows unbounded within a session. While history summarization helps across prompts, a single long agent loop can overflow context.
-
-**Recommendation:**
-- Add a `--maxContextTokens` option
-- Use a simple token estimator (4 chars ≈ 1 token)
-- Truncate oldest messages when approaching limit
-- Or use tiktoken-like library for accuracy
-
----
-
-### 4. No Streaming Support
-**File:** `agent.js:276`
-
-```javascript
-stream: false,
-```
-
-Long-running tool sequences show no progress until completion.
-
-**Recommendation:** Add `--stream` flag to enable streaming mode:
-```javascript
-stream: config.stream,
-// Then handle SSE chunks, printing assistant tokens as they arrive
-```
-
----
-
-### 5. No Retry Logic for Ollama Failures
-**File:** `agent.js:287-293`
-
-Network blips cause immediate failure.
-
-**Recommendation:** Add exponential backoff retry:
-```javascript
-async function callOllamaWithRetry(messages, tools, maxRetries = 3) {
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await callOllama(messages, tools);
-    } catch (e) {
-      if (i === maxRetries - 1) throw e;
-      await sleep(Math.pow(2, i) * 1000);
-    }
-  }
+interface TurnWorkingState {
+  turnId,
+  groupId,                    // Unique ID for this iteration group
+  iteration,                  // Resets to 1 at start of each group
+  maxIterations,
+  originalQuery,              // Preserved original user query
+  remainingQuery,             // Working query (original minus completed work)
+  currentTool,
+  groupToolResults[],         // Tool results from THIS group only
+  reminders[]
 }
+
+interface TurnOutput { response, stateSummary, branch }
+
+interface ToolEvent { id, toolName, args, result, success, timestamp, groupId }
+
+interface Reminder { toolName, reason, sourceToolEventId }
+
+type ReflectionDecision =
+  | { action: "continue", remainingQuery }  // More tools needed, updated query
+  | { action: "done", summary }             // Group complete, query satisfied
+  | { action: "ask", question }             // Need user clarification
 ```
 
----
-
-### 6. Tool Selection Could Be Smarter
-**File:** `agent.js:349-410`
-
-Keyword matching is simple but misses semantic relationships. "transfer to moon" won't match `mechjeb_hohmann_transfer` well.
-
-**Recommendations (pick one):**
-
-**A. Lightweight:** Add synonyms/aliases in tool metadata
-```javascript
-// Tool entry could have aliases
-aliases: ['transfer', 'orbit change', 'hohmann']
-```
-
-**B. Medium:** Use a small embedding model for semantic similarity
-```javascript
-// Pre-compute tool description embeddings
-// At runtime, embed user query, find nearest tools
-```
-
-**C. Simple improvement:** Score partial word matches, not just exact
-```javascript
-// "hohmann" partially matches "hohmann_transfer"
-if (entry.searchText.includes(keyword) ||
-    keyword.includes(entry.openAi.function.name.split('_')[1])) {
-```
-
----
-
-### 7. system.txt Is Not Used
-**File:** `system.txt` exists but `agent.js` uses `DEFAULT_SYSTEM_PROMPT` inline.
-
-The file contains a different, shorter prompt than what's in code.
-
-**Recommendation:** Either:
-- Delete `system.txt` (it's misleading)
-- Or load it as the default: `fs.readFileSync('./system.txt', 'utf8')`
-
----
-
-### 8. No Parallel Tool Execution
-**File:** `agent.js:652-700`
-
-Tools are executed sequentially in a `for...of` loop.
-
-**Recommendation:** If tools don't depend on each other, execute in parallel:
-```javascript
-const results = await Promise.allSettled(
-  toolCalls.map(call => executeToolCall(call, client, toolInventory))
-);
-```
-
-This could significantly speed up multi-tool turns.
-
----
-
-### 9. No Max Iterations Guard
-**File:** `agent.js:621`
-
-The `while (true)` loop has no iteration limit. A confused model could loop forever.
-
-**Recommendation:** Add a max iterations constant:
-```javascript
-const MAX_AGENT_ITERATIONS = 20;
-let iterations = 0;
-while (iterations++ < MAX_AGENT_ITERATIONS) {
-```
-
----
-
-### 10. Logging Could Be Configurable
-**File:** Throughout `agent.js`
-
-All logging goes to console. No way to reduce verbosity or log to file.
-
-**Recommendation:** Add `--verbose` / `--quiet` flags:
-```javascript
-const log = config.quiet ? () => {} : console.log;
-const debug = config.verbose ? console.log : () => {};
-```
-
----
-
-### 11. Consider Splitting the File
-**File:** `agent.js`
-
-800 lines is manageable but approaching the point where splitting helps:
-
-```
-src/
-  index.js          # Entry point, CLI parsing, main loop
-  ollama.js         # callOllama, streaming logic
-  mcp.js            # connectToMcp, transport setup
-  tools.js          # Tool conversion, selection, scoring
-  history.js        # Conversation history management
-  utils.js          # sanitizeToolText, coercePrimitive, etc.
-```
-
-**Trade-off:** Single-file is nice for deployment simplicity. Consider only if the file grows further.
-
----
-
-### 12. Error Messages Could Include Recovery Hints
-**File:** `agent.js:682-698`
-
-When tools fail, the error is logged but no recovery suggestion is given to the model.
-
-**Recommendation:** Enhance error messages:
-```javascript
-const errorBlock = sanitizeToolText(
-  `Tool ${name} failed: ${message}\n` +
-  `Suggestion: Check if prerequisites are met or try with different parameters.`
-);
-```
-
----
-
-## Performance Quick Wins
-
-1. **Cache tool inventory** - Don't rebuild `searchText`/`searchTokens` every call
-2. **Lazy tool loading** - Load full schemas only when tool is actually called
-3. **Connection pooling** - For HTTP transport, reuse connections
-
----
-
-## Future Architecture Considerations
-
-### 1. Plugin System for MCP Servers
-Instead of one MCP connection, support multiple:
-```javascript
-mcpServers: [
-  { name: 'ksp', bin: '../ksp-mcp/dist/index.js' },
-  { name: 'filesystem', bin: 'mcp-filesystem' },
-]
-```
-
-### 2. Tool Categories
-Group tools by category for smarter selection:
-```javascript
-categories: {
-  navigation: ['hohmann_transfer', 'change_inclination'],
-  status: ['kos_status', 'vessel_info'],
-}
-```
-
-### 3. Memory/RAG Integration
-For long-running sessions, integrate vector store for:
-- Semantic tool search
-- Long-term memory across sessions
-- Example-based tool selection
-
----
-
-## Recommended Priority Order
-
-| Priority | Change | Effort | Impact |
-|----------|--------|--------|--------|
-| 1 | Remove unused `zod` dep | 1 min | Cleanliness |
-| 2 | Add max iterations guard | 5 min | Reliability |
-| 3 | Make ALWAYS_INCLUDE_TOOLS configurable | 15 min | Generalization |
-| 4 | Delete or use system.txt | 5 min | Cleanliness |
-| 5 | Add retry logic for Ollama | 20 min | Reliability |
-| 6 | Add --verbose/--quiet flags | 15 min | UX |
-| 7 | Add context limit awareness | 1 hr | Reliability |
-| 8 | Add streaming support | 2 hr | UX |
-| 9 | Parallel tool execution | 30 min | Performance |
-
----
-
-## Implementation Plan
-
-Based on feedback:
-- **Scope:** Any MCP server (generalize away from KSP)
-- **Approach:** Staged - reliability first, modularization later
-- **Priority:** Generalization + Reliability in single file, then split once stable
-
-### Stage 1: Reliability & Generalization (Keep Single File)
-
-Add these features to `agent.js` without restructuring:
-
-#### 1.1 Remove unused zod
-```bash
-npm uninstall zod
-```
-
-#### 1.2 Add max iterations guard
-```javascript
-const MAX_AGENT_ITERATIONS = config.maxIterations ?? 20;
-let iterations = 0;
-while (iterations++ < MAX_AGENT_ITERATIONS) {
-  // existing loop body
-}
-if (iterations >= MAX_AGENT_ITERATIONS) {
-  console.warn('[agent] Max iterations reached, returning last response');
-}
-```
-
-#### 1.3 Add Ollama retry with exponential backoff
-```javascript
-async function callOllamaWithRetry(messages, tools, maxRetries = 3) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await callOllama(messages, tools);
-    } catch (e) {
-      if (attempt === maxRetries) throw e;
-      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
-      console.log(`[agent] Ollama retry ${attempt}/${maxRetries} in ${delay}ms...`);
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-}
-```
-
-#### 1.4 Make core tools configurable
-```javascript
-// Replace hardcoded ALWAYS_INCLUDE_TOOLS with:
-const coreToolsRaw = config.coreTools ?? process.env.CORE_TOOLS ?? '';
-const ALWAYS_INCLUDE_TOOLS = coreToolsRaw
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-```
-
-#### 1.5 Delete or use system.txt
-Either delete the file, or load it dynamically.
-
-### Stage 2: Modularization (Later)
-
-Once Stage 1 is stable, split into `src/` modules. Deferred to avoid debugging layout + features simultaneously.
-
-### Stage 3: Nice-to-Haves (Future)
-
-- Streaming support (`--stream`)
-- Context token estimation and trimming
-- Parallel tool execution
-- Config file support
-- `--verbose` / `--quiet` flags
-
----
-
-## Revised Implementation Order
-
-**Stage 1 Tasks (in order):**
-
-| # | Task | File | Effort |
-|---|------|------|--------|
-| 1 | Remove `zod` dependency | package.json | 1 min |
-| 2 | Add `--maxIterations` CLI option | agent.js | 5 min |
-| 3 | Add iteration guard to agent loop | agent.js:621 | 5 min |
-| 4 | Add `--maxRetries` CLI option | agent.js | 5 min |
-| 5 | Wrap `callOllama` with retry logic | agent.js | 15 min |
-| 6 | Add `--coreTools` CLI option | agent.js | 5 min |
-| 7 | Make `ALWAYS_INCLUDE_TOOLS` configurable | agent.js:35-43 | 10 min |
-| 8 | Delete `system.txt` or load dynamically | agent.js, system.txt | 5 min |
-| 9 | Update README with new options | README.md | 10 min |
-
----
-
-## Files Modified in Stage 1
-
-| File | Changes |
-|------|---------|
-| `package.json` | Remove zod |
-| `agent.js` | Add CLI options, retry logic, iteration guard, configurable core tools |
-| `system.txt` | Delete or keep (if loading dynamically) |
-| `README.md` | Document new CLI options |
-
----
-
-## New Configuration Options (Stage 1)
-
-| Option | Env | Default | Description |
-|--------|-----|---------|-------------|
-| `--coreTools` | `CORE_TOOLS` | `""` | Comma-separated tools to always include |
-| `--maxIterations` | `MAX_ITERATIONS` | `20` | Max agent loop iterations |
-| `--maxRetries` | `MAX_RETRIES` | `3` | Ollama call retry attempts |
+### 2. `src/core/services.ts` (~120 lines)
+Unified wrappers for external services (Ollama LLM, MCP tools):
+- `callLLM()`: wraps ollamaClient with retry/backoff, returns { content, toolCalls, attempts }
+- `callMcpTool()`: wraps MCP callTool, returns ToolEvent with normalized result
+
+### 3. `src/core/machine.ts` (~100-130 lines)
+Thin state machine orchestrator:
+- Enum: `MachineState { WAIT_USER, SELECT_TOOL, EXECUTE, REFLECT_SUMMARIZE, DONE }`
+- Single `runTurn(input, deps)` function with while loop over states
+- MAX_ITERATIONS = 6 constant
+- Calls overlay modules for each state's logic
+
+### 4. `src/overlay/select_tool.ts` (~280 lines)
+Fork from plan_tools.ts with key changes:
+- Returns `string | null` (single tool) instead of `string[]`
+- Prompt includes `groupToolResults` (current iteration group only) for context
+- Receives `remainingQuery` (not original) for tool selection
+- Knows its iteration number within the group
+- Keeps consensus with 7 temps + early exit
+- Removes ordering query logic (not needed)
+
+### 5. `src/overlay/reflect.ts` (~180 lines)
+Merges execute.ts reflection + summary.ts logic:
+- Compares `originalQuery` vs `groupToolResults` to evaluate progress
+- If more tools needed: creates `remainingQuery` (original minus completed work), returns `{ action: "continue", remainingQuery }`
+- If original query satisfied: ends iteration group, returns `{ action: "done", summary }` with user-facing response
+- If clarification needed: returns `{ action: "ask", question }`
+- May extract reminders from tool results for future iterations
+
+## Files to Modify
+
+### `src/overlay/execute.ts` (~150 lines, down from 413)
+Simplify to single-tool execution:
+- Remove the for loop (only one tool per call)
+- Remove embedded reflection logic (moved to reflect.ts)
+- Use `callMcpTool()` from services.ts
+- Return `ToolEvent` instead of `ToolExecutionResult`
+
+### `src/index.ts` (~200 lines)
+Switch to state machine:
+- Replace `runPipeline()` with `runTurn()` from machine.ts
+- Create `TurnInput` instead of `PipelineContext`
+- Create `MachineDeps` with all dependencies
+- Update history tracking to use new types
+
+## Files to Delete
+- `src/core/pipeline.ts` - replaced by machine.ts
+- `src/overlay/summary.ts` - merged into reflect.ts
+- `src/overlay/plan_tools.ts` - replaced by select_tool.ts (after migration)
+
+Already deleted (per git status):
+- `src/overlay/intro.ts`, `src/overlay/preflight.ts`, `src/overlay/stt_correct.ts`
+
+## Implementation Order
+
+### Phase 1: Foundation (no breaking changes)
+1. Create `src/core/turn-types.ts`
+2. Create `src/core/services.ts`
+
+### Phase 2: Overlay Modules
+3. Create `src/overlay/reflect.ts`
+4. Create `src/overlay/select_tool.ts` (fork from plan_tools.ts)
+5. Modify `src/overlay/execute.ts` (simplify to single tool)
+
+### Phase 3: Integration
+6. Create `src/core/machine.ts`
+7. Modify `src/index.ts` to use runTurn
+
+### Phase 4: Cleanup
+8. Delete `src/core/pipeline.ts`
+9. Delete `src/overlay/summary.ts`
+10. Delete `src/overlay/plan_tools.ts`
+
+## Key Design Decisions
+
+1. **Single tool per iteration**: SELECT_TOOL picks one tool → EXECUTE runs it → REFLECT decides if more needed
+2. **Iteration groups**: Iterations solving the same user query form a group; iteration counter resets when group ends
+3. **Query rewriting**: Reflect creates `remainingQuery` (original minus completed work); `originalQuery` preserved
+4. **Group-aware context**: Planning and reflect prioritize `groupToolResults` (current group only)
+5. **Consensus preserved**: Keep 7-temp consensus with early exit for tool selection reliability
+6. **Reminders**: Structured records in TurnWorkingState for carrying forward tool prerequisites
+7. **MAX_ITERATIONS = 6**: Single counter per group, checked in SELECT_TOOL state
+
+## State Transitions
+
+| From | To | Condition |
+|------|----|-----------|
+| SELECT_TOOL | EXECUTE | Tool selected |
+| SELECT_TOOL | REFLECT_SUMMARIZE | No tool (done or clarify) |
+| EXECUTE | REFLECT_SUMMARIZE | Tool complete |
+| REFLECT_SUMMARIZE | SELECT_TOOL | action="continue" |
+| REFLECT_SUMMARIZE | DONE | action="done" or "ask" |
+
+## Preserved Logic
+- Retry utilities (`src/core/retry.ts`) - unchanged
+- Consensus utilities (`src/core/consensus.ts`) - unchanged
+- Ollama client (`src/core/ollama.ts`) - unchanged, wrapped by services.ts
+- Tool utilities (`src/utils/tools.ts`) - unchanged
+- Agent prompts (`src/overlay/agent.ts`) - unchanged, startup only

@@ -11,16 +11,9 @@ import { createSpinner } from "./ui/spinner.js";
 import { blankLine, separator } from "./ui/output.js";
 import { createOllamaClient } from "./core/ollama.js";
 import { connectToMcp } from "./mcp/client.js";
-import { fetchStatusInfo } from "./mcp/resources.js";
 import { generateAgentPrompts } from "./overlay/agent.js";
-import { runPipeline, type PipelineContext, type PipelineStep } from "./core/pipeline.js";
-import { step as sttCorrectStep } from "./overlay/stt_correct.js";
-import { step as preflightStep } from "./overlay/preflight.js";
-import { step as planStep } from "./overlay/plan_tools.js";
-import { step as executeStep } from "./overlay/execute.js";
-import { step as summaryStep } from "./overlay/summary.js";
-import { step as clarifyStep } from "./overlay/intro.js";
-import type { HistoryEntry } from "./utils/history.js";
+import { runTurn, type MachineDeps } from "./core/machine.js";
+import type { TurnInput, HistoryEntry } from "./core/turn-types.js";
 import {
   truncateMiddle,
   flattenWhitespace,
@@ -35,17 +28,6 @@ import {
   raiseHand,
   enableSpeechInterrupt,
 } from "./ui/input.js";
-
-// Default pipeline configuration
-const defaultPipeline: PipelineStep[] = [
-  // overlay/agent is used at startup
-  //sttCorrectStep,  // Only runs for voice input
-  //preflightStep,
-  planStep,
-  executeStep,
-  summaryStep,
-  clarifyStep,
-];
 
 async function main(): Promise<void> {
   const { config, prompt: cliPrompt } = parseConfig();
@@ -83,8 +65,8 @@ async function main(): Promise<void> {
   });
 
   // roleForAssistant resolves in background while user reads greeting
-  let agentPrompts: { roleForUser: string; roleForAssistant: string } | null = null;
-  const getAgentPrompts = async () => {
+  let agentPrompts: { roleForUser: string; roleForAssistant: string } | undefined;
+  const getAgentPrompts = async (): Promise<{ roleForUser: string; roleForAssistant: string }> => {
     if (!agentPrompts) {
       agentPrompts = { roleForUser, roleForAssistant: await roleForAssistantPromise };
     }
@@ -110,41 +92,37 @@ async function main(): Promise<void> {
     }
   };
 
-  const pipelineDeps = {
-    config,
-    client,
-    ollamaClient,
-    spinner,
-    agentLog: loggers.agentLog,
-    agentWarn: loggers.agentWarn,
-    agentError: loggers.agentError,
-    toLLMLog: loggers.toLLMLog,
-    toToolLog: loggers.toToolLog,
-    fromToolLog: loggers.fromToolLog,
-    say,
-  };
-
   // Single-prompt mode: process once and exit
   if (cliPrompt) {
     loggers.agentLog(`[agent] Single-prompt mode: "${cliPrompt}"`);
     spinner.stop();
 
-    const { statusInfo } = await fetchStatusInfo(client, { agentLog: loggers.agentLog, agentWarn: loggers.agentWarn }, "Planning ");
-
-    const ctx: PipelineContext = {
+    const turnInput: TurnInput = {
       userInput: cliPrompt,
       previousResponse: roleForUser,
+      inputSource: "keyboard",
+    };
+
+    const machineDeps: MachineDeps = {
+      config,
+      client,
+      ollamaClient,
       toolInventory,
       agentPrompts: await getAgentPrompts(),
       history: [],
-      statusInfo,
+      spinner,
+      agentLog: loggers.agentLog,
+      agentWarn: loggers.agentWarn,
+      agentError: loggers.agentError,
+      toLLMLog: loggers.toLLMLog,
+      toToolLog: loggers.toToolLog,
+      fromToolLog: loggers.fromToolLog,
+      say,
     };
 
-    // Only run plan for single-prompt mode
-    const planOnlyPipeline = [planStep];
-    await runPipeline(planOnlyPipeline, ctx, pipelineDeps);
-
-    loggers.agentLog(`[agent] Planning result: ${ctx.plannedTools?.length ?? 0} tools, branch=${ctx.branch}`);
+    const output = await runTurn(turnInput, machineDeps);
+    loggers.agentLog(`[agent] Result: branch=${output.branch}`);
+    loggers.assistantLog(output.response);
     await shutdown();
     return;
   }
@@ -199,47 +177,49 @@ async function main(): Promise<void> {
       ? truncateMiddle(lastEntry.fullResponse, 1000)
       : roleForUser;
 
-    const { statusInfo } = await fetchStatusInfo(
-      client,
-      { agentLog: loggers.agentLog, agentWarn: loggers.agentWarn },
-      "Planning "
-    );
-
-    const ctx: PipelineContext = {
+    const turnInput: TurnInput = {
       userInput: trimmedInput,
       previousResponse,
       inputSource,
+    };
+
+    const machineDeps: MachineDeps = {
+      config,
+      client,
+      ollamaClient,
       toolInventory,
       agentPrompts: await getAgentPrompts(),
       history: commandHistory,
-      statusInfo,
+      spinner,
+      agentLog: loggers.agentLog,
+      agentWarn: loggers.agentWarn,
+      agentError: loggers.agentError,
+      toLLMLog: loggers.toLLMLog,
+      toToolLog: loggers.toToolLog,
+      fromToolLog: loggers.fromToolLog,
+      say,
     };
 
     try {
-      // Run the full pipeline
-      await runPipeline(defaultPipeline, ctx, pipelineDeps);
+      // Run the state machine
+      const turnOutput = await runTurn(turnInput, machineDeps);
       blankLine(config.debug);
-
-      const answer = ctx.response ?? "I could not determine which tools to use for your request. Please try rephrasing.";
 
       spinner.stop();
       blankLine(config.debug);
       separator(config.debug, "ANSWER");
-      loggers.assistantLog(answer);
-      void say(answer);
+      loggers.assistantLog(turnOutput.response);
+      void say(turnOutput.response);
       enableSpeechInterrupt();
 
       commandHistory.push({
         prompt: trimmedInput,
-        toolEvents: (ctx.toolResults ?? []).map((e) => ({
-          name: e.tool,
-          success: e.status === "success",
-        })),
+        toolEvents: [],  // TODO: extract from turn output when needed
         finalSummary: truncateMiddle(
-          flattenWhitespace(ctx.stateSummary ?? answer),
+          flattenWhitespace(turnOutput.stateSummary),
           HISTORY_RESULT_TEXT_LIMIT
         ),
-        fullResponse: answer,
+        fullResponse: turnOutput.response,
       });
     } catch (error) {
       spinner.stop();
