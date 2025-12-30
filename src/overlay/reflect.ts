@@ -40,7 +40,12 @@ function formatCompletedWork(toolResults: ToolEvent[]): string {
   return toolResults
     .map((e, i) => {
       const statusIcon = e.success ? "\u2713" : "\u2717";
-      return `${i + 1}. ${e.toolName} ${statusIcon}:\n${e.result}`;
+      // Truncate error results to avoid huge MCP error dumps
+      let result = e.result;
+      if (!e.success && result.length > 200) {
+        result = result.slice(0, 200) + "...";
+      }
+      return `${i + 1}. ${e.toolName} ${statusIcon}:\n${result}`;
     })
     .join("\n\n");
 }
