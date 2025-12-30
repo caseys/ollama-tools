@@ -29,7 +29,7 @@ import { reflectAndSummarize } from "../overlay/reflect.js";
 
 // === Constants ===
 
-const MAX_ITERATIONS = 6;
+const MAX_ITERATIONS = 20;
 
 // === Dependencies ===
 
