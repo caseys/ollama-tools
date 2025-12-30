@@ -10,7 +10,7 @@
 
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Config, AgentPrompts } from "../types.js";
-import type { Logger, ToolLogger } from "../ui/logger.js";
+import type { Logger, ToolLogger, ResultLogger } from "../ui/logger.js";
 import type { Spinner } from "../ui/spinner.js";
 import type { OllamaClient } from "../core/ollama.js";
 import type { InventoryEntry } from "../utils/tools.js";
@@ -23,6 +23,7 @@ import {
   safeParseArguments,
   formatParameterHints,
 } from "../utils/tools.js";
+import { ASK_USER_TOOL, isAskUserCall } from "../tools/ask-user.js";
 
 // === Dependencies ===
 
@@ -38,7 +39,9 @@ export interface ExecuteToolDeps {
   agentError: Logger;
   toToolLog: ToolLogger;
   fromToolLog: ToolLogger;
+  resultLog: ResultLogger;
   say: (text: string) => void;
+  sayResult: (text: string) => void;
 }
 
 // === Prompt Building ===
@@ -73,13 +76,62 @@ ${tool.description}${parameterHints ? `
 PARAMETERS:
 ${parameterHints}` : ""}${previousContext}
 
-TASK: Extract arguments for this tool from the user query and call "${tool.name}".
-1. You MUST call the provided tool.
-2. Replace invalid names/values with valid ones - speech-to-text may mangle argument values.
-3. Only provide arguments explicitly specified or clearly implied by the user.
-4. Do NOT make up argument values.`;
+TASK: Call "${tool.name}" with arguments from the user query.
+
+RULES:
+1. Call ${tool.name} if you can extract reasonable arguments.
+2. Do NOT explain limitations or worry about future steps - they are handled separately.
+3. Extract only arguments that are explicitly stated or clearly implied.
+4. Fix speech-to-text errors in argument values.
+5. LAST RESORT: If a required argument is genuinely missing and cannot be inferred, call ask_user("question") to get clarification.`;
 
   return { system, user: userQuery };
+}
+
+// === Speech Helpers ===
+
+const GENERIC_ERROR_WORDS = ["error", "failed", "failure", "exception", "err"];
+
+function isGenericErrorLine(line: string): boolean {
+  const lower = line.toLowerCase().trim();
+  return GENERIC_ERROR_WORDS.some(word => lower === word || lower === `${word}:`);
+}
+
+function buildSpokenResult(
+  toolName: string,
+  args: Record<string, unknown>,
+  success: boolean,
+  result: string
+): string {
+  const readableName = toolName.replaceAll("_", " ");
+
+  if (success) {
+    // For success, use first meaningful line
+    const firstLine = result.split("\n")[0] ?? "";
+    return firstLine || `${readableName} completed`;
+  }
+
+  // For errors, build descriptive message
+  const lines = result.split("\n").filter(l => l.trim());
+  const firstLine = lines[0] ?? "";
+
+  // Find first meaningful error line (skip generic "ERROR" lines)
+  let errorDetail = "";
+  for (const line of lines) {
+    if (!isGenericErrorLine(line)) {
+      errorDetail = line;
+      break;
+    }
+  }
+
+  // Build spoken message
+  const argsCount = Object.keys(args).length;
+  const argsDesc = argsCount > 0 ? ` with ${argsCount} argument${argsCount > 1 ? "s" : ""}` : "";
+
+  if (errorDetail && !isGenericErrorLine(errorDetail)) {
+    return `${readableName}${argsDesc} failed: ${errorDetail}`;
+  }
+  return `${readableName}${argsDesc} failed`;
 }
 
 // === Main Function ===
@@ -140,7 +192,7 @@ export async function executeTool(
       { role: "system", content: prompt.system },
       { role: "user", content: prompt.user },
     ],
-    [toolEntry.openAi],
+    [toolEntry.openAi, ASK_USER_TOOL],  // Include ask_user as escape hatch
     {
       spinnerMessage: `Step ${state.iteration}: ${toolName}`,
       maxRetries: 2,
@@ -155,7 +207,27 @@ export async function executeTool(
     deps.agentLog(`[execute] IGNORED LLM TEXT DURING TOOL CALL: ${llmResult.content}`);
   }
 
-  // Extract and normalize arguments
+  // Check if LLM called ask_user instead of the target tool
+  const calledTool = llmResult.toolCalls[0];
+  if (calledTool && isAskUserCall(calledTool.name)) {
+    const question = (calledTool.arguments?.question as string) ?? "Could you clarify?";
+    deps.agentLog(`[execute] LLM requested clarification: "${question}"`);
+
+    // Return special event that signals need for user input
+    return {
+      id: randomUUID(),
+      toolName: "ask_user",
+      args: { question },
+      result: question,
+      success: true,
+      needsUserInput: true,
+      originalTool: toolName,  // Remember what tool we were trying to call
+      timestamp: Date.now(),
+      groupId: state.groupId,
+    };
+  }
+
+  // Extract and normalize arguments for the actual tool
   const rawArgs = llmResult.toolCalls[0]?.arguments ?? {};
   const args = normalizeArgumentsForEntry(toolEntry, safeParseArguments(rawArgs));
 
@@ -178,9 +250,12 @@ export async function executeTool(
       }
     );
 
-    // Announce result
-    const firstLine = event.result.split("\n")[0] ?? "";
-    deps.say(firstLine);
+    // Print full result for user (always visible)
+    deps.resultLog(toolName, event.success, event.result);
+
+    // Announce result via speech - clears any stale notifications from queue
+    const spokenMessage = buildSpokenResult(toolName, args, event.success, event.result);
+    deps.sayResult(spokenMessage);
 
     if (!event.success) {
       deps.agentError(`[execute] Tool ${toolName} failed: ${event.result.split("\n").slice(0, 3).join(" | ")}`);

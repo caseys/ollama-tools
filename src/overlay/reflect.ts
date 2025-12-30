@@ -191,12 +191,18 @@ async function getRemainingQuery(
   state: TurnWorkingState,
   deps: ReflectDeps
 ): Promise<string> {
+  // Check if remainingQuery has clarification context that needs stripping
+  const hasClarification = state.remainingQuery.includes("[User clarified");
+  const clarificationNote = hasClarification
+    ? `\nNote: Strip any "[User clarified...]" lines - that context was for a completed tool call.`
+    : "";
+
   const prompt = `${context}
 
 TASK: What remains to be done?
 
 The original request was: "${state.originalQuery}"
-Some work has been completed (see COMPLETED WORK above).
+Some work has been completed (see COMPLETED WORK above).${clarificationNote}
 
 Reply with ONLY the remaining task - what still needs to be done.
 Example: If original was "go to Mun and land" and transfer is done, reply "land on the Mun"`;
@@ -208,7 +214,7 @@ Example: If original was "go to Mun and land" and transfer is done, reply "land 
     { spinnerMessage: "Planning next step", silent: true }
   );
 
-  return result.content.trim() || state.remainingQuery;
+  return result.content.trim() || state.originalQuery;
 }
 
 async function getSummary(

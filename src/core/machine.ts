@@ -10,7 +10,7 @@
 import { randomUUID } from "node:crypto";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Config, AgentPrompts } from "../types.js";
-import type { Logger, ToolLogger } from "../ui/logger.js";
+import type { Logger, ToolLogger, ResultLogger } from "../ui/logger.js";
 import type { Spinner } from "../ui/spinner.js";
 import type { OllamaClient } from "./ollama.js";
 import type { InventoryEntry } from "../utils/tools.js";
@@ -47,7 +47,11 @@ export interface MachineDeps {
   toLLMLog: Logger;
   toToolLog: ToolLogger;
   fromToolLog: ToolLogger;
+  resultLog: ResultLogger;
   say: (text: string) => void;
+  sayResult: (text: string) => void;
+  // For ask_user escape hatch - prompts user for clarification during tool execution
+  promptUser: (question: string) => Promise<string>;
 }
 
 // === State Summary Builder ===
@@ -126,7 +130,7 @@ export async function runTurn(
         if (selectionResult.tool) {
           deps.agentLog(`[machine] Selected: ${selectionResult.tool}`);
           console.log(`Tool: ${selectionResult.tool}`);
-          deps.say(`Tool: ${selectionResult.tool}`);
+          // Speech handled by spinner.start() in executeTool with { latest: true }
           machineState = MachineState.EXECUTE;
         } else {
           deps.agentLog(`[machine] No tool selected (${selectionResult.consensusCount}/${selectionResult.queriesRun} consensus), moving to reflect`);
@@ -148,9 +152,30 @@ export async function runTurn(
           agentError: deps.agentError,
           toToolLog: deps.toToolLog,
           fromToolLog: deps.fromToolLog,
+          resultLog: deps.resultLog,
           say: deps.say,
+          sayResult: deps.sayResult,
         });
 
+        // Check for ask_user escape hatch - needs user clarification
+        if (toolEvent.needsUserInput) {
+          const question = toolEvent.result;
+          deps.agentLog(`[machine] ask_user triggered: "${question}"`);
+
+          // Don't add to groupToolResults - this is internal clarification
+          // Prompt the user and prepend their answer for the retry
+          const userAnswer = await deps.promptUser(question);
+          deps.agentLog(`[machine] User clarification: "${userAnswer}"`);
+
+          // Prepend user's answer so it's prominent for argument extraction
+          state.remainingQuery = `[User clarified "${question}": ${userAnswer}]\n\n${state.remainingQuery}`;
+
+          // Stay in EXECUTE with same currentTool - retry the tool call
+          // Note: currentTool is already set, don't clear it
+          break;
+        }
+
+        // Normal flow - add to results and go to reflect
         state.groupToolResults.push(toolEvent);
         state.currentTool = undefined;
         machineState = MachineState.REFLECT_SUMMARIZE;

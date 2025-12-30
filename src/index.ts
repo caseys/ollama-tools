@@ -26,13 +26,14 @@ import {
   setVoiceBusy,
   say,
   raiseHand,
+  sayResult,
   enableSpeechInterrupt,
 } from "./ui/input.js";
 
 async function main(): Promise<void> {
   const { config, prompt: cliPrompt } = parseConfig();
   const loggers = createLoggers(config.debug);
-  const spinner = createSpinner(config.debug, loggers.agentLog, { say, raiseHand });
+  const spinner = createSpinner(config.debug, loggers.agentLog, { raiseHand });
 
   const ollamaClient = createOllamaClient({
     config,
@@ -117,7 +118,14 @@ async function main(): Promise<void> {
       toLLMLog: loggers.toLLMLog,
       toToolLog: loggers.toToolLog,
       fromToolLog: loggers.fromToolLog,
+      resultLog: loggers.resultLog,
       say,
+      sayResult,
+      // Single-prompt mode: no interactive input available
+      promptUser: async (question: string) => {
+        loggers.agentWarn(`[agent] ask_user in single-prompt mode: "${question}" - returning empty`);
+        return "";
+      },
     };
 
     const output = await runTurn(turnInput, machineDeps);
@@ -197,7 +205,17 @@ async function main(): Promise<void> {
       toLLMLog: loggers.toLLMLog,
       toToolLog: loggers.toToolLog,
       fromToolLog: loggers.fromToolLog,
+      resultLog: loggers.resultLog,
       say,
+      sayResult,
+      // Interactive mode: prompt user for clarification via readline
+      promptUser: async (question: string) => {
+        spinner.stop();
+        output.write(`\n❓ ${question}\n`);
+        void say(question);
+        const answer = await rl.question("clarify> ");
+        return answer.trim();
+      },
     };
 
     try {
@@ -209,7 +227,7 @@ async function main(): Promise<void> {
       blankLine(config.debug);
       separator(config.debug, "ANSWER");
       loggers.assistantLog(turnOutput.response);
-      void say(turnOutput.response);
+      void sayResult(turnOutput.response);
       enableSpeechInterrupt();
 
       commandHistory.push({

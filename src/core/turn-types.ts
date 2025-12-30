@@ -26,6 +26,9 @@ export interface ToolEvent {
   success: boolean;
   timestamp: number;
   groupId: string;
+  // ask_user escape hatch fields
+  needsUserInput?: boolean;  // True if this is an ask_user clarification request
+  originalTool?: string;     // The tool we were trying to call when ask_user was triggered
 }
 
 // === Reminder ===
