@@ -62,28 +62,30 @@ function buildFocusedToolPrompt(
   const tool = toolEntry.openAi.function;
   const parameterHints = formatParameterHints(tool);
 
+  // ALWAYS show pipeline context - critical for LLM to understand scope
+  const pipelineInfo = `PIPELINE: Step ${iteration} of up to ${maxIterations}. Other steps handle the rest of the mission.`;
+
   const previousContext = previousResult
-    ? `\n\nCONTEXT:
-- Iteration: ${iteration}/${maxIterations}
-- Previous: ${previousResult.toolName} \u2192 ${previousResult.result.split("\n")[0]}`
+    ? `\nPrevious: ${previousResult.toolName} \u2192 ${previousResult.result.split("\n")[0]}`
     : "";
 
   const system = `${agentPrompts.roleForAssistant}
+
+${pipelineInfo}${previousContext}
 
 TOOL: ${tool.name}
 ${tool.description}${parameterHints ? `
 
 PARAMETERS:
-${parameterHints}` : ""}${previousContext}
+${parameterHints}` : ""}
 
-TASK: Call "${tool.name}" with arguments from the user query.
+YOUR ONLY JOB: Call "${tool.name}" with arguments from the query below. Do NOT output text.
 
 RULES:
-1. Call ${tool.name} if you can extract reasonable arguments.
-2. Do NOT explain limitations or worry about future steps - they are handled separately.
-3. Extract only arguments that are explicitly stated or clearly implied.
-4. Fix speech-to-text errors in argument values.
-5. LAST RESORT: If a required argument is genuinely missing and cannot be inferred, call ask_user("question") to get clarification.`;
+1. Call ${tool.name} - extract arguments from the query.
+2. Other tools handle future steps. Do NOT worry about the full mission.
+3. Fix speech-to-text errors in argument values.
+4. LAST RESORT: Call ask_user("question") if a required argument is genuinely missing.`;
 
   return { system, user: userQuery };
 }
