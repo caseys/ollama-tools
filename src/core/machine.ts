@@ -192,6 +192,7 @@ export async function runTurn(
           spinner: deps.spinner,
           agentLog: deps.agentLog,
           agentWarn: deps.agentWarn,
+          toLLMLog: deps.toLLMLog,
         });
 
         if (decision.action === "continue") {

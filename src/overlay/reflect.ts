@@ -30,6 +30,7 @@ export interface ReflectDeps {
   spinner: Spinner;
   agentLog: Logger;
   agentWarn: Logger;
+  toLLMLog: Logger;
 }
 
 // === Helpers ===
@@ -144,6 +145,10 @@ Reply with exactly ONE word:
 - CONTINUE - More work remains (request is NOT fully complete)
 - DONE - The ENTIRE request is fully satisfied
 - ASK - Cannot proceed without user clarification (USE THIS if tools keep failing)`;
+
+  // Log the reflect prompt for debugging
+  deps.toLLMLog("[toLLM] ─── Reflect Decision Prompt ───");
+  deps.toLLMLog(prompt);
 
   let queryIndex = 0;
   const consensusResult = await runWithConsensus<Decision>(
