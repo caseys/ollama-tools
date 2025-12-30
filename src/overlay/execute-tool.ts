@@ -207,9 +207,27 @@ export async function executeTool(
     deps.agentLog(`[execute] IGNORED LLM TEXT DURING TOOL CALL: ${llmResult.content}`);
   }
 
-  // Check if LLM called ask_user instead of the target tool
+  // Check if LLM returned no tool call at all
   const calledTool = llmResult.toolCalls[0];
-  if (calledTool && isAskUserCall(calledTool.name)) {
+  if (!calledTool) {
+    // LLM refused to call tool - return failure with its text for reflect to handle
+    const llmText = llmResult.content.trim() || "LLM did not call any tool";
+    deps.agentError(`[execute] LLM returned no tool call after ${llmResult.attempts} attempts`);
+    deps.agentLog(`[execute] LLM text: ${llmText.slice(0, 200)}`);
+
+    return {
+      id: randomUUID(),
+      toolName,
+      args: {},
+      result: `LLM RESULT ERROR: Model did not call ${toolName}.\n\nModel response: ${llmText}`,
+      success: false,
+      timestamp: Date.now(),
+      groupId: state.groupId,
+    };
+  }
+
+  // Check if LLM called ask_user instead of the target tool
+  if (isAskUserCall(calledTool.name)) {
     const question = (calledTool.arguments?.question as string) ?? "Could you clarify?";
     deps.agentLog(`[execute] LLM requested clarification: "${question}"`);
 
@@ -228,7 +246,7 @@ export async function executeTool(
   }
 
   // Extract and normalize arguments for the actual tool
-  const rawArgs = llmResult.toolCalls[0]?.arguments ?? {};
+  const rawArgs = calledTool.arguments ?? {};
   const args = normalizeArgumentsForEntry(toolEntry, safeParseArguments(rawArgs));
 
   // Execute the tool
