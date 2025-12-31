@@ -76,7 +76,15 @@ async function main(): Promise<void> {
 
   const rl = readline.createInterface({ input, output });
 
-  initVoiceListener(loggers.agentLog);
+  // Initialize voice listener only if speech is enabled
+  if (config.speechEnabled) {
+    initVoiceListener(loggers.agentLog);
+  }
+
+  // Create conditional speech functions (no-op when disabled)
+  const maybeSay = config.speechEnabled ? say : () => {};
+  const maybeSayResult = config.speechEnabled ? sayResult : () => {};
+  const maybeEnableSpeechInterrupt = config.speechEnabled ? enableSpeechInterrupt : () => {};
 
   let shuttingDown = false;
   const commandHistory: Array<HistoryEntry & { fullResponse?: string }> = [];
@@ -84,7 +92,9 @@ async function main(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    stopVoiceListener();
+    if (config.speechEnabled) {
+      stopVoiceListener();
+    }
     rl.close();
     try {
       await transport.close();
@@ -119,8 +129,8 @@ async function main(): Promise<void> {
       toToolLog: loggers.toToolLog,
       fromToolLog: loggers.fromToolLog,
       resultLog: loggers.resultLog,
-      say,
-      sayResult,
+      say: maybeSay,
+      sayResult: maybeSayResult,
       // Single-prompt mode: no interactive input available
       promptUser: async (question: string) => {
         loggers.agentWarn(`[agent] ask_user in single-prompt mode: "${question}" - returning empty`);
@@ -139,8 +149,8 @@ async function main(): Promise<void> {
   spinner.stop();
   blankLine(config.debug);
   loggers.assistantLog(roleForUser);
-  void say(roleForUser);
-  enableSpeechInterrupt();
+  void maybeSay(roleForUser);
+  maybeEnableSpeechInterrupt();
   blankLine(config.debug);
   loggers.agentLog('[agent] Type or speak a prompt (or "exit" to quit).');
 
@@ -206,13 +216,13 @@ async function main(): Promise<void> {
       toToolLog: loggers.toToolLog,
       fromToolLog: loggers.fromToolLog,
       resultLog: loggers.resultLog,
-      say,
-      sayResult,
+      say: maybeSay,
+      sayResult: maybeSayResult,
       // Interactive mode: prompt user for clarification via readline
       promptUser: async (question: string) => {
         spinner.stop();
         output.write(`\n❓ ${question}\n`);
-        void say(question);
+        void maybeSay(question);
         const answer = await rl.question("clarify> ");
         return answer.trim();
       },
@@ -227,8 +237,8 @@ async function main(): Promise<void> {
       blankLine(config.debug);
       separator(config.debug, "ANSWER");
       loggers.assistantLog(turnOutput.response);
-      void sayResult(turnOutput.response);
-      enableSpeechInterrupt();
+      void maybeSayResult(turnOutput.response);
+      maybeEnableSpeechInterrupt();
 
       commandHistory.push({
         prompt: trimmedInput,

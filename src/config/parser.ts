@@ -7,6 +7,9 @@ import type { ParseResult } from "../types.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Platform detection for speech defaults
+const isMac = process.platform === "darwin";
+
 function resolveMcpBin(binPath: string | undefined): string {
   if (!binPath) {
     return "";
@@ -22,6 +25,13 @@ function parsePositiveInt(value: string, defaultValue: number): number {
 }
 
 export function parseConfig(): ParseResult {
+  // Determine speech default: enabled on Mac, disabled elsewhere
+  // Can be overridden via SPEECH_ENABLED env var
+  const speechEnvSet = process.env["SPEECH_ENABLED"] !== undefined;
+  const speechDefault = speechEnvSet
+    ? process.env["SPEECH_ENABLED"] === "true"
+    : isMac;
+
   const {
     values: {
       model,
@@ -33,6 +43,7 @@ export function parseConfig(): ParseResult {
       toolTimeout,
       debug,
       prompt,
+      speech,
     },
   } = parseArgs({
     options: {
@@ -75,9 +86,26 @@ export function parseConfig(): ParseResult {
         type: "string",
         short: "p",
       },
+      speech: {
+        type: "boolean",
+        default: speechDefault,
+      },
     },
     allowPositionals: false,
   });
+
+  // Check if speech was explicitly enabled on non-Mac platform
+  const speechEnabled = speech ?? speechDefault;
+  const speechExplicitlyEnabled =
+    speechEnvSet || process.argv.includes("--speech");
+
+  if (speechEnabled && !isMac && speechExplicitlyEnabled) {
+    console.warn(
+      "\n\u26A0\uFE0F  Speech enabled but hear-say only supports macOS currently.\n" +
+        "   Please help add support for your platform:\n" +
+        "   https://github.com/anthropics/hear-say\n"
+    );
+  }
 
   const transportValue = (transport ?? "stdio").toLowerCase();
   if (transportValue !== "stdio" && transportValue !== "http") {
@@ -97,6 +125,7 @@ export function parseConfig(): ParseResult {
       maxRetries: parsePositiveInt(maxRetries ?? "3", 3),
       toolTimeout: parsePositiveInt(toolTimeout ?? "900000", 600_000),
       debug: debug ?? false,
+      speechEnabled,
     },
     prompt,
   };

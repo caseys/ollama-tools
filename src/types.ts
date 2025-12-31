@@ -9,6 +9,7 @@ export interface Config {
   maxRetries: number;
   toolTimeout: number;
   debug: boolean;
+  speechEnabled: boolean;
 }
 
 export interface ParseResult {
