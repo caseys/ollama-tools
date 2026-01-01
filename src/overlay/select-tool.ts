@@ -201,8 +201,11 @@ export async function selectTool(
 ): Promise<SelectToolResult> {
   deps.agentLog(`[select] Iteration ${state.iteration}/${state.maxIterations}`);
 
-  if (!state.remainingQuery.trim()) {
-    deps.agentLog("[select] Empty remaining query, returning undefined");
+  // Guard against empty or "none" remaining queries
+  const trimmedQuery = state.remainingQuery.trim();
+  const lowerQuery = trimmedQuery.toLowerCase();
+  if (!trimmedQuery || lowerQuery === "none" || lowerQuery === "nothing" || lowerQuery === "n/a") {
+    deps.agentLog("[select] Empty/none remaining query, returning undefined");
     return { tool: undefined, consensusCount: 0, queriesRun: 0 };
   }
 

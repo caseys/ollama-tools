@@ -82,6 +82,23 @@ export function makeToolLogger(
   };
 }
 
+export interface ResultLogger {
+  (toolName: string, success: boolean, result: string): void;
+}
+
+export function makeResultLogger(): ResultLogger {
+  return function (toolName: string, success: boolean, result: string): void {
+    const icon = success ? "\u2713" : "\u2717";
+    const colorCode = success ? COLOR_CODES.fromTool : COLOR_CODES.error;
+    const header = `${icon} ${toolName}`;
+    console.log(colorize(header, colorCode));
+    // Print each non-empty line of result
+    for (const line of result.split("\n").filter(l => l.trim())) {
+      console.log(colorize(`  ${line}`, colorCode));
+    }
+  };
+}
+
 export interface Loggers {
   agentLog: Logger;
   agentWarn: Logger;
@@ -91,6 +108,7 @@ export interface Loggers {
   assistantLog: Logger;
   toToolLog: ToolLogger;
   fromToolLog: ToolLogger;
+  resultLog: ResultLogger;
 }
 
 export function createLoggers(debugMode: boolean): Loggers {
@@ -103,5 +121,6 @@ export function createLoggers(debugMode: boolean): Loggers {
     assistantLog: makeLogger("log", COLOR_CODES.fromLLM, false, debugMode),
     toToolLog: makeToolLogger("to", debugMode),
     fromToolLog: makeToolLogger("from", debugMode),
+    resultLog: makeResultLogger(),
   };
 }

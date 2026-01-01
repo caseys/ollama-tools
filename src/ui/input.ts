@@ -1,6 +1,6 @@
 import type { Interface as ReadlineInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { hear, say, raiseHand } from "hear-say";
+import { hear, say } from "hear-say";
 import type { InputResult } from "../types.js";
 import type { Logger } from "./logger.js";
 
@@ -73,7 +73,7 @@ export function initVoiceListener(agentLog: Logger): void {
     if (!trimmed) return;
 
     if (voiceBusy) {
-      void say("Hold on, I'm busy.");
+      void sayNow("Hold on, I'm busy.");
       agentLog(`[voice] (ignored while busy) "${trimmed}"`);
     } else if (voicePendingResolve) {
       agentLog(`[voice] "${trimmed}"`);
@@ -106,4 +106,16 @@ export function disableSpeechInterrupt(): void {
   }
 }
 
-export { say, raiseHand };
+function raiseHand(text: string): void {
+  void say(text, { latest: true });
+}
+
+function sayResult(text: string): void {
+  void say(text, { interrupt: true, clear: true });
+}
+
+function sayNow(text: string): void {
+  void say(text, { rude: true });
+}
+
+export { say, raiseHand, sayResult, sayNow };

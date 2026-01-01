@@ -30,7 +30,7 @@ export async function generateAgentPrompts(
 STATUS:
 ${statusInfo || "No status available."}
 
-TASK: Write a 1-2 sentence greeting describing what you can help with.
+TASK: Write a short, 1 sentence greeting describing what you can help with.
 Write in first person: "I can help you..."
 Focus on what you can accomplish with these TOOLS considering STATUS.`;
 

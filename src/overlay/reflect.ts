@@ -209,13 +209,16 @@ async function getRemainingQuery(
 
   const prompt = `${context}
 
-TASK: What remains to be done?
+TASK: What specific action remains to complete the original request?
 
-The original request was: "${state.originalQuery}"
-Some work has been completed (see COMPLETED WORK above).${clarificationNote}
+Original: "${state.originalQuery}"
+Completed work is listed in COMPLETED WORK above.${clarificationNote}
 
-Reply with ONLY the remaining task - what still needs to be done.
-Example: If original was "go to Mun and land" and transfer is done, reply "land on the Mun"`;
+IMPORTANT: Reply with the SPECIFIC remaining action, not a summary.
+- If everything is done, reply with exactly: NONE
+- Otherwise reply with the remaining task (e.g., "land on the Mun")
+
+DO NOT reply with meta-commentary. Only the task or NONE.`;
 
   const result = await callLLM(
     deps.ollamaClient,
@@ -296,6 +299,15 @@ export async function reflectAndSummarize(
   if (decision === "continue") {
     const remainingQuery = await getRemainingQuery(context, state, deps);
     deps.agentLog(`[reflect] Remaining: ${remainingQuery}`);
+
+    // Validate: if remaining is empty/none, task is actually done
+    const lower = remainingQuery.toLowerCase().trim();
+    if (!remainingQuery.trim() || lower === "none" || lower === "nothing" || lower === "n/a") {
+      deps.agentLog(`[reflect] Empty remaining query, overriding to DONE`);
+      const summary = await getSummary(context, state, deps);
+      return { action: "done", summary };
+    }
+
     return { action: "continue", remainingQuery };
   }
 

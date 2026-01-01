@@ -85,7 +85,8 @@ RULES:
 1. Call ${tool.name} - extract arguments from the query.
 2. Other tools handle future steps. Do NOT worry about the full mission.
 3. Fix speech-to-text errors in argument values.
-4. LAST RESORT: Call ask_user("question") if a required argument is genuinely missing.`;
+4. Replace invalid argument names with valid names from STATUS (fix speech-to-text errors).
+5. LAST RESORT: Call ask_user("question") if a required argument is genuinely missing. Do not ask about invalid nouns`;
 
   return { system, user: userQuery };
 }

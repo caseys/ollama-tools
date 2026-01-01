@@ -9,7 +9,6 @@ export interface Spinner {
 }
 
 export interface SpinnerDeps {
-  say?: (text: string) => void;
   raiseHand?: (text: string) => void;
 }
 
@@ -21,7 +20,7 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
   function start(message: string): void {
     if (message !== currentMessage) {
       currentMessage = message;
-      deps?.say?.(message);
+      deps?.raiseHand?.(message);
     }
     if (debugMode) return;
     stop();
