@@ -23,6 +23,7 @@ import {
 } from "./turn-types.js";
 
 // Import state handlers from overlays
+import { interpret } from "../overlay/interpret.js";
 import { selectTool } from "../overlay/select-tool.js";
 import { executeTool } from "../overlay/execute-tool.js";
 import { reflectAndSummarize } from "../overlay/reflect.js";
@@ -40,6 +41,7 @@ export interface MachineDeps {
   toolInventory: InventoryEntry[];
   agentPrompts: AgentPrompts;
   history: HistoryEntry[];
+  interpretHistory: string[];  // Previous interpreted queries (persisted across turns)
   spinner: Spinner;
   agentLog: Logger;
   agentWarn: Logger;
@@ -86,15 +88,70 @@ export async function runTurn(
     reminders: [],
     failedTools: [],
     executeRetryCount: 0,
+    interpretHistory: deps.interpretHistory,
   };
 
-  let machineState: MachineState = MachineState.SELECT_TOOL;
+  let machineState: MachineState = MachineState.INTERPRET;
+  let interpretedQuery: string | undefined;
 
   // State machine loop - exits via return statements
   while (true) {
     deps.agentLog(`[machine] State: ${machineState}, iteration: ${state.iteration}`);
 
     switch (machineState) {
+      case MachineState.INTERPRET: {
+        const result = await interpret(state, input, {
+          config: deps.config,
+          client: deps.client,
+          ollamaClient: deps.ollamaClient,
+          toolInventory: deps.toolInventory,
+          agentPrompts: deps.agentPrompts,
+          spinner: deps.spinner,
+          agentLog: deps.agentLog,
+          agentWarn: deps.agentWarn,
+          toLLMLog: deps.toLLMLog,
+        });
+
+        if (result.action === "respond") {
+          deps.agentLog(`[machine] INTERPRET returned response directly`);
+          return {
+            response: result.response,
+            stateSummary: "",
+            branch: "satisfied",
+            // No interpretedQuery for direct responses - not adding to history
+          };
+        }
+
+        if (result.action === "ask") {
+          deps.agentLog(`[machine] INTERPRET needs clarification`);
+          return {
+            response: result.question,
+            stateSummary: "",
+            branch: "ask",
+            // No interpretedQuery for ask - not adding to history yet
+          };
+        }
+
+        if (result.action === "execute") {
+          // Direct tool match - skip SELECT_TOOL and go straight to EXECUTE
+          deps.agentLog(`[machine] INTERPRET matched tool directly: ${result.tool}`);
+          interpretedQuery = result.interpretedQuery;
+          state.remainingQuery = result.interpretedQuery;
+          state.currentTool = result.tool;
+          state.iteration++;
+          console.log(`Tool: ${result.tool}`);
+          machineState = MachineState.EXECUTE;
+          break;
+        }
+
+        // action === "proceed"
+        interpretedQuery = result.interpretedQuery;
+        state.remainingQuery = result.interpretedQuery;
+        deps.agentLog(`[machine] INTERPRET proceeding with: "${result.interpretedQuery.slice(0, 60)}..."`);
+        machineState = MachineState.SELECT_TOOL;
+        break;
+      }
+
       case MachineState.SELECT_TOOL: {
         state.iteration++;
 
@@ -105,6 +162,7 @@ export async function runTurn(
             response: "Maximum iterations reached. " + buildStateSummary(state),
             stateSummary: buildStateSummary(state),
             branch: "max_iterations",
+            ...(interpretedQuery && { interpretedQuery }),
           };
         }
 
@@ -134,6 +192,19 @@ export async function runTurn(
           console.log(`Tool: ${selectionResult.tool}`);
           // Speech handled by spinner.start() in executeTool with { latest: true }
           machineState = MachineState.EXECUTE;
+        } else if (selectionResult.question) {
+          // LLM returned a question instead of a tool - ask the user
+          deps.agentLog(`[machine] SELECT_TOOL returned question: "${selectionResult.question.slice(0, 60)}..."`);
+          return {
+            response: selectionResult.question,
+            stateSummary: buildStateSummary(state),
+            branch: "ask",
+            ...(interpretedQuery && { interpretedQuery }),
+          };
+        } else if (selectionResult.isDone) {
+          // LLM explicitly said "done" - skip to reflect for summary
+          deps.agentLog(`[machine] SELECT_TOOL returned done, moving to reflect for summary`);
+          machineState = MachineState.REFLECT_SUMMARIZE;
         } else {
           deps.agentLog(`[machine] No tool selected (${selectionResult.consensusCount}/${selectionResult.queriesRun} consensus), moving to reflect`);
           machineState = MachineState.REFLECT_SUMMARIZE;
@@ -220,6 +291,7 @@ export async function runTurn(
             response: decision.question,
             stateSummary: buildStateSummary(state),
             branch: "ask",
+            ...(interpretedQuery && { interpretedQuery }),
           };
         } else {
           // action === "done"
@@ -227,6 +299,7 @@ export async function runTurn(
             response: decision.summary,
             stateSummary: buildStateSummary(state),
             branch: "satisfied",
+            ...(interpretedQuery && { interpretedQuery }),
           };
         }
         break;
@@ -240,5 +313,6 @@ export async function runTurn(
     response: "Turn completed unexpectedly",
     stateSummary: buildStateSummary(state),
     branch: "error",
+    ...(interpretedQuery && { interpretedQuery }),
   };
 }

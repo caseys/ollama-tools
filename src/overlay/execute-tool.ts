@@ -97,8 +97,7 @@ RULES:
 1. Call ${tool.name} - extract arguments from the query.
 2. Ignore parts of the user query that don't map to this tool's parameters. Later steps handle those.
 3. Only include arguments explicitly stated or clearly implied. Omit optional args not mentioned.
-4. If unsure about a required argument, use defaults or make a reasonable guess.
-5. Speech-to-text may mangle arguments - try to correct name in STATUS or try with names/values even if you are not certain they are valid.`;
+4. If unsure about a required argument, use defaults or make a reasonable guess.`;
 
   return { system, user: userQuery };
 }
@@ -200,8 +199,16 @@ export async function executeTool(
     deps.agentLog(`[execute] Retrying ${toolName} after failure`);
   }
 
-  // Fetch current status for context
-  const { statusInfo } = await fetchStatusInfo(deps.client, { agentLog: deps.agentLog, agentWarn: deps.agentWarn }, "Execute ");
+  // Use cached status or fetch fresh
+  let statusInfo: string;
+  if (state.cachedStatusInfo !== undefined) {
+    deps.agentLog("[execute] Using cached status");
+    statusInfo = state.cachedStatusInfo;
+  } else {
+    const result = await fetchStatusInfo(deps.client, { agentLog: deps.agentLog, agentWarn: deps.agentWarn }, "Execute ");
+    statusInfo = result.statusInfo;
+    state.cachedStatusInfo = statusInfo;
+  }
 
   const prompt = buildFocusedToolPrompt(
     state.remainingQuery,
@@ -291,11 +298,15 @@ export async function executeTool(
       deps.agentError(`[execute] Tool ${toolName} failed: ${event.result.split("\n").slice(0, 3).join(" | ")}`);
     }
 
+    // Clear status cache after tool execution (status may have changed)
+    delete state.cachedStatusInfo;
     return event;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     deps.agentError(`[execute] Tool ${toolName} threw error: ${message}`);
 
+    // Clear status cache after tool execution attempt
+    delete state.cachedStatusInfo;
     return {
       id: randomUUID(),
       toolName,

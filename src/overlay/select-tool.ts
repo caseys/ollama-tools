@@ -41,16 +41,26 @@ export interface SelectToolDeps {
 
 // === Parser ===
 
+interface ParsedSelection {
+  tool: string | undefined;
+  isDone: boolean;
+  question: string | undefined;  // Non-matching text treated as question
+}
+
 function parseSingleToolResponse(
   text: string | undefined,
   toolInventory: InventoryEntry[]
-): string | undefined {
-  if (!text || !text.trim()) return undefined;
+): ParsedSelection {
+  if (!text || !text.trim()) {
+    return { tool: undefined, isDone: false, question: undefined };
+  }
 
-  // Check for explicit null/none responses
-  const lower = text.toLowerCase().trim();
-  if (lower === "null" || lower === "none" || lower === "false") {
-    return undefined;
+  const trimmed = text.trim();
+  const lower = trimmed.toLowerCase();
+
+  // Check for explicit done/null/none responses
+  if (lower === "done" || lower === "null" || lower === "none" || lower === "false" || lower === "complete" || lower === "completed") {
+    return { tool: undefined, isDone: true, question: undefined };
   }
 
   // Build set of valid tool names (lowercase for comparison)
@@ -61,18 +71,24 @@ function parseSingleToolResponse(
   // Exact match: find the tool name in the response
   for (const [lowerName, canonicalName] of toolNames) {
     if (lower.includes(lowerName)) {
-      return canonicalName;
+      return { tool: canonicalName, isDone: false, question: undefined };
     }
   }
 
-  return undefined;
+  // No tool match - treat as a question to user
+  return { tool: undefined, isDone: false, question: trimmed };
 }
 
 // === Consensus Matching ===
 
-function toolsMatch(a: string | undefined, b: string | undefined): boolean {
-  if (a === undefined || b === undefined) return a === b;
-  return a === b;
+function selectionsMatch(a: ParsedSelection, b: ParsedSelection): boolean {
+  // Both done
+  if (a.isDone && b.isDone) return true;
+  // Both same tool
+  if (a.tool && b.tool && a.tool === b.tool) return true;
+  // Both questions (we don't compare question text, just that both are questions)
+  if (a.question && b.question) return true;
+  return false;
 }
 
 // === Query Building ===
@@ -131,13 +147,12 @@ TASK: Select the NEXT tool to work toward completing the user request.
 RULES:
 1. Select ONE tool that advances toward the goal
 2. Consider what has already been done in PREVIOUS RESULTS
-3. If the request is already satisfied or no tool applies, return null
-4. STT may sound-out proper nouns. Match spoken words to actual names from TOOLS and STATUS.
-5. Do not repeat tools that already succeeded for the same purpose
+3. If the request is already satisfied or no tool applies, say "done"
+4. Do not repeat tools that already succeeded for the same purpose
+5. As last resort, get clarification from the user by asking a question
+6. If you are 100% sure we are done, reply with "done".
 
-OUTPUT: Return ONLY the tool name as a JSON string.
-Examples: "launch_and_circularize", "hohmann_transfer", or null if done.
-Do NOT return objects like {"tool": "name"} - just the string.`;
+OUTPUT: Reply with ONLY a tool name.`;
 
   return [
     { role: "system", content: system },
@@ -152,7 +167,7 @@ async function runSelectionQuery(
   toolInventory: InventoryEntry[],
   params: SamplingParams,
   deps: SelectToolDeps
-): Promise<string | undefined> {
+): Promise<ParsedSelection> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     controller.abort();
@@ -179,7 +194,7 @@ async function runSelectionQuery(
     const text = extractAssistantText(response.message).trim();
     if (!text) {
       deps.agentLog(`[select] Query (temp=${params.temperature}) returned empty`);
-      return undefined;
+      return { tool: undefined, isDone: false, question: undefined };
     }
 
     deps.agentLog(`[select] Query (temp=${params.temperature}): "${text.slice(0, 50)}${text.length > 50 ? "..." : ""}"`);
@@ -187,7 +202,7 @@ async function runSelectionQuery(
   } catch (error) {
     clearTimeout(timeoutId);
     deps.agentWarn(`[select] Query failed (temp=${params.temperature}): ${error instanceof Error ? error.message : String(error)}`);
-    return undefined;
+    return { tool: undefined, isDone: false, question: undefined };
   }
 }
 
@@ -195,6 +210,8 @@ async function runSelectionQuery(
 
 export interface SelectToolResult {
   tool: string | undefined;
+  isDone: boolean;
+  question: string | undefined;  // LLM returned a question instead of tool
   consensusCount: number;
   queriesRun: number;
 }
@@ -212,16 +229,24 @@ export async function selectTool(
   const trimmedQuery = state.remainingQuery.trim();
   const lowerQuery = trimmedQuery.toLowerCase();
   if (!trimmedQuery || lowerQuery === "none" || lowerQuery === "nothing" || lowerQuery === "n/a") {
-    deps.agentLog("[select] Empty/none remaining query, returning undefined");
-    return { tool: undefined, consensusCount: 0, queriesRun: 0 };
+    deps.agentLog("[select] Empty/none remaining query, returning done");
+    return { tool: undefined, isDone: true, question: undefined, consensusCount: 0, queriesRun: 0 };
   }
 
-  // Fetch current status
-  const { statusInfo } = await fetchStatusInfo(
-    deps.client,
-    { agentLog: deps.agentLog, agentWarn: deps.agentWarn },
-    "Selecting "
-  );
+  // Use cached status or fetch fresh
+  let statusInfo: string;
+  if (state.cachedStatusInfo !== undefined) {
+    deps.agentLog("[select] Using cached status");
+    statusInfo = state.cachedStatusInfo;
+  } else {
+    const result = await fetchStatusInfo(
+      deps.client,
+      { agentLog: deps.agentLog, agentWarn: deps.agentWarn },
+      "Selecting "
+    );
+    statusInfo = result.statusInfo;
+    state.cachedStatusInfo = statusInfo;
+  }
 
   // Summarize history from previous sessions
   const historySummary = summarizeHistory(deps.history, 5);
@@ -240,16 +265,18 @@ export async function selectTool(
 
   deps.toLLMLog("[toLLM] ─── Select Tool Prompt ───");
   deps.toLLMLog(messages[0]?.content ?? "");
+  deps.toLLMLog("\n[user]");
+  deps.toLLMLog(messages[1]?.content ?? "");
 
   // Run consensus with early exit - consensus varies sampling params
   let queryIndex = 0;
-  const consensusResult = await runWithConsensus<string | undefined>(
+  const consensusResult = await runWithConsensus<ParsedSelection>(
     async (params: SamplingParams) => {
       queryIndex++;
       deps.spinner.update(`Selecting (${queryIndex})`);
       return runSelectionQuery(messages, deps.toolInventory, params, deps);
     },
-    toolsMatch,
+    selectionsMatch,
     {
       maxQueries: 7,
       minMatches: 3,
@@ -260,18 +287,40 @@ export async function selectTool(
 
   // Log results
   for (const [index, result] of consensusResult.allResults.entries()) {
-    deps.agentLog(`[select] Query ${index + 1}: ${result ?? "(none)"}`);
+    let desc: string;
+    if (result.tool) {
+      desc = result.tool;
+    } else if (result.isDone) {
+      desc = "done";
+    } else if (result.question) {
+      desc = `question: ${result.question.slice(0, 30)}...`;
+    } else {
+      desc = "(none)";
+    }
+    deps.agentLog(`[select] Query ${index + 1}: ${desc}`);
   }
 
   deps.agentLog(
     `[select] Consensus: ${consensusResult.matchCount} matches from ${consensusResult.queriesRun} queries`
   );
 
-  const selectedTool = consensusResult.result;
-  deps.agentLog(`[select] Selected: ${selectedTool ?? "(none)"}`);
+  const selection = consensusResult.result ?? { tool: undefined, isDone: false, question: undefined };
+  let selectedDesc: string;
+  if (selection.tool) {
+    selectedDesc = selection.tool;
+  } else if (selection.isDone) {
+    selectedDesc = "done";
+  } else if (selection.question) {
+    selectedDesc = "question";
+  } else {
+    selectedDesc = "(none)";
+  }
+  deps.agentLog(`[select] Selected: ${selectedDesc}`);
 
   return {
-    tool: selectedTool,
+    tool: selection.tool,
+    isDone: selection.isDone,
+    question: selection.question,
     consensusCount: consensusResult.matchCount,
     queriesRun: consensusResult.queriesRun,
   };

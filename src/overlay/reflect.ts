@@ -88,18 +88,13 @@ This indicates the model is confident no more actions are required.`;
 If the same tool keeps failing, ASK the user for help rather than retrying.`;
   }
 
-  // Add STT note if there were failures (might be name confusion from voice input)
-  const sttNote = failureCount > 0
-    ? `\n\nNote: If tool failed due to name mismatch, it may be STT error - spoken word sounded like intended name.`
-    : "";
-
   return `${deps.agentPrompts.roleForAssistant}
 
 ORIGINAL REQUEST:
 ${state.originalQuery}
 
 COMPLETED WORK:
-${formatCompletedWork(state.groupToolResults)}${toolSelectionContext}${failureWarning}${sttNote}
+${formatCompletedWork(state.groupToolResults)}${toolSelectionContext}${failureWarning}
 
 AVAILABLE TOOLS:
 ${formatToolsByTier(deps.toolInventory)}
@@ -258,13 +253,32 @@ Reply with 1-2 sentences for the user describing what was done.`;
 
 async function getQuestion(
   context: string,
+  state: TurnWorkingState,
   deps: ReflectDeps
 ): Promise<string> {
-  const prompt = `${context}
+  // Get most recent failure for focused questioning
+  const failures = state.groupToolResults.filter((e) => !e.success);
+  const lastFailure = failures.at(-1);
 
-TASK: What question should we ask the user?
+  let taskPrompt: string;
+  if (lastFailure) {
+    // Focus on the specific error
+    taskPrompt = `TASK: The tool "${lastFailure.toolName}" failed with this error:
+${lastFailure.result}
+
+Ask the user ONE specific question about how to handle this error.
+- Focus on the error message and what options the user has
+- Do NOT ask about mission objectives or clarifications unrelated to the error
+- Be concise and actionable`;
+  } else {
+    taskPrompt = `TASK: What question should we ask the user?
 
 Reply with the question only.`;
+  }
+
+  const prompt = `${context}
+
+${taskPrompt}`;
 
   const result = await callLLM(
     deps.ollamaClient,
@@ -286,12 +300,20 @@ export async function reflectAndSummarize(
   const failureCount = state.groupToolResults.filter((e) => !e.success).length;
   deps.agentLog(`[reflect] Iteration ${state.iteration}, ${state.groupToolResults.length} tool(s) completed, ${failureCount} failed`);
 
-  // Fetch fresh status for accurate reflection
-  const { statusInfo } = await fetchStatusInfo(
-    deps.client,
-    { agentLog: deps.agentLog, agentWarn: deps.agentWarn },
-    "Reflecting "
-  );
+  // Use cached status or fetch fresh (typically fresh after tool execution)
+  let statusInfo: string;
+  if (state.cachedStatusInfo !== undefined) {
+    deps.agentLog("[reflect] Using cached status");
+    statusInfo = state.cachedStatusInfo;
+  } else {
+    const result = await fetchStatusInfo(
+      deps.client,
+      { agentLog: deps.agentLog, agentWarn: deps.agentWarn },
+      "Reflecting "
+    );
+    statusInfo = result.statusInfo;
+    state.cachedStatusInfo = statusInfo;
+  }
 
   // Build shared context
   const context = buildContext(state, statusInfo, deps);
@@ -317,7 +339,7 @@ export async function reflectAndSummarize(
   }
 
   if (decision === "ask") {
-    const question = await getQuestion(context, deps);
+    const question = await getQuestion(context, state, deps);
     return { action: "ask", question };
   }
 
