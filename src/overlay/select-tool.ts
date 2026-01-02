@@ -106,7 +106,7 @@ function formatPreviousResults(toolResults: ToolEvent[]): string {
     return `${i + 1}. ${e.toolName} ${statusIcon}:\n${result}`;
   });
 
-  return `\nPREVIOUS RESULTS (this session):\n${entries.join("\n\n")}`;
+  return `\nMISSION PROGRESS:\n${entries.join("\n\n")}`;
 }
 
 function buildSelectToolPrompt(
@@ -146,7 +146,7 @@ TASK: Select the NEXT tool to work toward completing the user request.
 
 RULES:
 1. Select ONE tool that advances toward the goal
-2. Consider what has already been done in PREVIOUS RESULTS
+2. Consider what has already been done in MISSION PROGRESS
 3. If the request is already satisfied or no tool applies, say "done"
 4. Do not repeat tools that already succeeded for the same purpose
 5. As last resort, get clarification from the user by asking a question

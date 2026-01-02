@@ -41,14 +41,9 @@ function formatCompletedWork(toolResults: ToolEvent[]): string {
   return toolResults
     .map((e, i) => {
       const statusIcon = e.success ? "\u2713" : "\u2717";
-      // Truncate error results to avoid huge MCP error dumps (but keep enough for context)
-      let result = e.result;
-      if (!e.success && result.length > 500) {
-        result = result.slice(0, 500) + "...";
-      }
-      return `${i + 1}. ${e.toolName} ${statusIcon}:\n${result}`;
+      return `${i + 1}. ${e.toolName} ${statusIcon}`;
     })
-    .join("\n\n");
+    .join("\n");
 }
 
 function generateDefaultSummary(state: TurnWorkingState): string {
@@ -93,7 +88,7 @@ If the same tool keeps failing, ASK the user for help rather than retrying.`;
 ORIGINAL REQUEST:
 ${state.originalQuery}
 
-COMPLETED WORK:
+MISSION PROGRESS:
 ${formatCompletedWork(state.groupToolResults)}${toolSelectionContext}${failureWarning}
 
 AVAILABLE TOOLS:
@@ -237,9 +232,14 @@ async function getSummary(
 ): Promise<string> {
   const prompt = `${context}
 
-TASK: Summarize what was accomplished.
+TASK: Summarize what THIS MISSION accomplished.
 
-Reply with 1-2 sentences for the user describing what was done.`;
+RULES:
+- Summarize only what the tools in MISSION PROGRESS did
+- For informational tools (status, get_*): say what info was shown
+- Do NOT describe past missions
+
+Reply with 1-2 sentences.`;
 
   const result = await callLLM(
     deps.ollamaClient,
