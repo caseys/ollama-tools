@@ -82,10 +82,10 @@ function formatPreviousResults(toolResults: ToolEvent[]): string {
 
   const entries = toolResults.map((e, i) => {
     const statusIcon = e.success ? "\u2713" : "\u2717";
-    // Truncate error results to avoid huge MCP error dumps
+    // Truncate error results to avoid huge MCP error dumps (but keep enough for context)
     let result = e.result;
-    if (!e.success && result.length > 200) {
-      result = result.slice(0, 200) + "...";
+    if (!e.success && result.length > 500) {
+      result = result.slice(0, 500) + "...";
     }
     return `${i + 1}. ${e.toolName} ${statusIcon}:\n${result}`;
   });
@@ -105,6 +105,12 @@ function buildSelectToolPrompt(
 ): OllamaMessage[] {
   const previousContext = formatPreviousResults(previousResults);
 
+  // Show last failure for context (but don't tell LLM to avoid - might need retry with different args)
+  const lastFailure = previousResults.filter(e => !e.success).at(-1);
+  const lastFailureNote = lastFailure
+    ? `\n⚠️ LAST FAILURE: ${lastFailure.toolName} - may need different arguments if retrying`
+    : '';
+
   const system = `${agentPrompts.roleForAssistant}
 
 TOOLS:
@@ -116,6 +122,7 @@ ${statusInfo || "No status available."}
 HISTORY (previous sessions):
 ${historySummary || "This is the first request."}
 ${previousContext}
+${lastFailureNote}
 
 ITERATION: ${iteration}/${maxIterations}
 
@@ -125,7 +132,7 @@ RULES:
 1. Select ONE tool that advances toward the goal
 2. Consider what has already been done in PREVIOUS RESULTS
 3. If the request is already satisfied or no tool applies, return null
-4. Replace invalid tool names with valid names from TOOLS (fix speech-to-text errors)
+4. STT may sound-out proper nouns. Match spoken words to actual names from TOOLS and STATUS.
 5. Do not repeat tools that already succeeded for the same purpose
 
 OUTPUT: Return ONLY the tool name as a JSON string.

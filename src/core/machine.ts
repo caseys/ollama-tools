@@ -50,7 +50,7 @@ export interface MachineDeps {
   resultLog: ResultLogger;
   say: (text: string) => void;
   sayResult: (text: string) => void;
-  // For ask_user escape hatch - prompts user for clarification during tool execution
+  // Prompts user for clarification when LLM can't extract tool arguments
   promptUser: (question: string) => Promise<string>;
 }
 
@@ -84,6 +84,8 @@ export async function runTurn(
     currentTool: undefined,
     groupToolResults: [],
     reminders: [],
+    failedTools: [],
+    executeRetryCount: 0,
   };
 
   let machineState: MachineState = MachineState.SELECT_TOOL;
@@ -157,26 +159,41 @@ export async function runTurn(
           sayResult: deps.sayResult,
         });
 
-        // Check for ask_user escape hatch - needs user clarification
-        if (toolEvent.needsUserInput) {
-          const question = toolEvent.result;
-          deps.agentLog(`[machine] ask_user triggered: "${question}"`);
+        // Check for text-only response (LLM didn't call tool)
+        if (toolEvent.llmTextResponse) {
+          const MAX_EXECUTE_RETRIES = 2;
+          state.executeRetryCount++;
 
-          // Don't add to groupToolResults - this is internal clarification
-          // Prompt the user and prepend their answer for the retry
-          const userAnswer = await deps.promptUser(question);
+          if (state.executeRetryCount < MAX_EXECUTE_RETRIES) {
+            // Retry - add context about the failure
+            deps.agentLog(`[machine] LLM text response, retry ${state.executeRetryCount}/${MAX_EXECUTE_RETRIES}`);
+            state.remainingQuery = `[Previous attempt returned text: "${toolEvent.llmTextResponse.slice(0, 100)}"]\n\n${state.remainingQuery}`;
+            // Stay in EXECUTE with same currentTool
+            break;
+          }
+
+          // Max retries reached - prompt user with the LLM's text as a question
+          deps.agentLog(`[machine] Max retries reached, prompting user with: "${toolEvent.llmTextResponse.slice(0, 100)}"`);
+          const userAnswer = await deps.promptUser(toolEvent.llmTextResponse);
           deps.agentLog(`[machine] User clarification: "${userAnswer}"`);
 
-          // Prepend user's answer so it's prominent for argument extraction
-          state.remainingQuery = `[User clarified "${question}": ${userAnswer}]\n\n${state.remainingQuery}`;
-
-          // Stay in EXECUTE with same currentTool - retry the tool call
-          // Note: currentTool is already set, don't clear it
+          // Prepend user's answer and retry
+          state.remainingQuery = `[User clarified: ${userAnswer}]\n\n${state.remainingQuery}`;
+          state.executeRetryCount = 0;  // Reset for next attempt
           break;
         }
 
+        // Reset retry count on successful tool call
+        state.executeRetryCount = 0;
+
         // Normal flow - add to results and go to reflect
         state.groupToolResults.push(toolEvent);
+
+        // Track failed tools for selection avoidance
+        if (!toolEvent.success && !state.failedTools.includes(toolEvent.toolName)) {
+          state.failedTools.push(toolEvent.toolName);
+        }
+
         state.currentTool = undefined;
         machineState = MachineState.REFLECT_SUMMARIZE;
         break;

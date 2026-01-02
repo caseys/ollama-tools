@@ -23,7 +23,7 @@ import {
   safeParseArguments,
   formatParameterHints,
 } from "../utils/tools.js";
-import { ASK_USER_TOOL, isAskUserCall } from "../tools/ask-user.js";
+import { fetchStatusInfo } from "../mcp/resources.js";
 
 // === Dependencies ===
 
@@ -57,7 +57,9 @@ function buildFocusedToolPrompt(
   previousResult: ToolEvent | undefined,
   iteration: number,
   maxIterations: number,
-  agentPrompts: AgentPrompts
+  agentPrompts: AgentPrompts,
+  statusInfo: string | undefined,
+  retryContext?: { previousError: string }
 ): ToolPromptResult {
   const tool = toolEntry.openAi.function;
   const parameterHints = formatParameterHints(tool);
@@ -69,9 +71,14 @@ function buildFocusedToolPrompt(
     ? `\nPrevious: ${previousResult.toolName} \u2192 ${previousResult.result.split("\n")[0]}`
     : "";
 
+  // If retrying after failure, show the error prominently
+  const retryWarning = retryContext
+    ? `\n\n⚠️ RETRY: This tool just failed with:\n${retryContext.previousError}\n\nFix the arguments based on this error.`
+    : "";
+
   const system = `${agentPrompts.roleForAssistant}
 
-${pipelineInfo}${previousContext}
+${pipelineInfo}${previousContext}${retryWarning}
 
 TOOL: ${tool.name}
 ${tool.description}${parameterHints ? `
@@ -79,14 +86,19 @@ ${tool.description}${parameterHints ? `
 PARAMETERS:
 ${parameterHints}` : ""}
 
-YOUR ONLY JOB: Call "${tool.name}" with arguments from the query below. Do NOT output text.
+STATUS:
+${statusInfo || "No status available."}
+
+YOUR ONLY JOB: Call "${tool.name}" with arguments from the query below.
+
+CRITICAL: You MUST call "${tool.name}".  Or as a last resort:respond with clarifying question for user.
 
 RULES:
 1. Call ${tool.name} - extract arguments from the query.
-2. Other tools handle future steps. Do NOT worry about the full mission.
-3. Fix speech-to-text errors in argument values.
-4. Replace invalid argument names with valid names from STATUS (fix speech-to-text errors).
-5. LAST RESORT: Call ask_user("question") if a required argument is genuinely missing. Do not ask about invalid nouns`;
+2. Ignore parts of the user query that don't map to this tool's parameters. Later steps handle those.
+3. Only include arguments explicitly stated or clearly implied. Omit optional args not mentioned.
+4. If unsure about a required argument, use defaults or make a reasonable guess.
+5. Speech-to-text may mangle arguments - try to correct name in STATUS or try with names/values even if you are not certain they are valid.`;
 
   return { system, user: userQuery };
 }
@@ -177,13 +189,29 @@ export async function executeTool(
 
   // Build focused prompt for argument extraction
   const previousResult = state.groupToolResults.at(-1);
+
+  // Check if we're retrying the same tool after a failure
+  const isRetry = previousResult && !previousResult.success && previousResult.toolName === toolName;
+  const retryContext = isRetry
+    ? { previousError: previousResult.result.slice(0, 500) }  // Include error but truncate
+    : undefined;
+
+  if (isRetry) {
+    deps.agentLog(`[execute] Retrying ${toolName} after failure`);
+  }
+
+  // Fetch current status for context
+  const { statusInfo } = await fetchStatusInfo(deps.client, { agentLog: deps.agentLog, agentWarn: deps.agentWarn }, "Execute ");
+
   const prompt = buildFocusedToolPrompt(
     state.remainingQuery,
     toolEntry,
     previousResult,
     state.iteration,
     state.maxIterations,
-    deps.agentPrompts
+    deps.agentPrompts,
+    statusInfo,
+    retryContext
   );
 
   // Get arguments via LLM
@@ -195,10 +223,10 @@ export async function executeTool(
       { role: "system", content: prompt.system },
       { role: "user", content: prompt.user },
     ],
-    [toolEntry.openAi, ASK_USER_TOOL],  // Include ask_user as escape hatch
+    [toolEntry.openAi],  // Only the target tool
     {
       spinnerMessage: `Step ${state.iteration}: ${toolName}`,
-      maxRetries: 2,
+      maxRetries: 1,  // Reduced - machine.ts will handle retries with user prompting
       onRetry: () => {
         deps.agentWarn(`[execute] Model didn't call ${toolName}. Retrying...`);
       },
@@ -213,36 +241,17 @@ export async function executeTool(
   // Check if LLM returned no tool call at all
   const calledTool = llmResult.toolCalls[0];
   if (!calledTool) {
-    // LLM refused to call tool - return failure with its text for reflect to handle
-    const llmText = llmResult.content.trim() || "LLM did not call any tool";
-    deps.agentError(`[execute] LLM returned no tool call after ${llmResult.attempts} attempts`);
-    deps.agentLog(`[execute] LLM text: ${llmText.slice(0, 200)}`);
+    // LLM returned text instead of calling tool - capture for retry/prompting
+    const llmText = llmResult.content.trim() || "Could not understand the request";
+    deps.agentWarn(`[execute] LLM returned text instead of tool call: "${llmText.slice(0, 100)}"`);
 
     return {
       id: randomUUID(),
       toolName,
       args: {},
-      result: `LLM RESULT ERROR: Model did not call ${toolName}.\n\nModel response: ${llmText}`,
+      result: llmText,
       success: false,
-      timestamp: Date.now(),
-      groupId: state.groupId,
-    };
-  }
-
-  // Check if LLM called ask_user instead of the target tool
-  if (isAskUserCall(calledTool.name)) {
-    const question = (calledTool.arguments?.question as string) ?? "Could you clarify?";
-    deps.agentLog(`[execute] LLM requested clarification: "${question}"`);
-
-    // Return special event that signals need for user input
-    return {
-      id: randomUUID(),
-      toolName: "ask_user",
-      args: { question },
-      result: question,
-      success: true,
-      needsUserInput: true,
-      originalTool: toolName,  // Remember what tool we were trying to call
+      llmTextResponse: llmText,  // Signal this is a text-only response for retry handling
       timestamp: Date.now(),
       groupId: state.groupId,
     };

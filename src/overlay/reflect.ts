@@ -41,10 +41,10 @@ function formatCompletedWork(toolResults: ToolEvent[]): string {
   return toolResults
     .map((e, i) => {
       const statusIcon = e.success ? "\u2713" : "\u2717";
-      // Truncate error results to avoid huge MCP error dumps
+      // Truncate error results to avoid huge MCP error dumps (but keep enough for context)
       let result = e.result;
-      if (!e.success && result.length > 200) {
-        result = result.slice(0, 200) + "...";
+      if (!e.success && result.length > 500) {
+        result = result.slice(0, 500) + "...";
       }
       return `${i + 1}. ${e.toolName} ${statusIcon}:\n${result}`;
     })
@@ -88,13 +88,18 @@ This indicates the model is confident no more actions are required.`;
 If the same tool keeps failing, ASK the user for help rather than retrying.`;
   }
 
+  // Add STT note if there were failures (might be name confusion from voice input)
+  const sttNote = failureCount > 0
+    ? `\n\nNote: If tool failed due to name mismatch, it may be STT error - spoken word sounded like intended name.`
+    : "";
+
   return `${deps.agentPrompts.roleForAssistant}
 
 ORIGINAL REQUEST:
 ${state.originalQuery}
 
 COMPLETED WORK:
-${formatCompletedWork(state.groupToolResults)}${toolSelectionContext}${failureWarning}
+${formatCompletedWork(state.groupToolResults)}${toolSelectionContext}${failureWarning}${sttNote}
 
 AVAILABLE TOOLS:
 ${formatToolsByTier(deps.toolInventory)}

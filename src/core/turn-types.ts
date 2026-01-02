@@ -26,9 +26,8 @@ export interface ToolEvent {
   success: boolean;
   timestamp: number;
   groupId: string;
-  // ask_user escape hatch fields
-  needsUserInput?: boolean;  // True if this is an ask_user clarification request
-  originalTool?: string;     // The tool we were trying to call when ask_user was triggered
+  // When LLM returns text instead of calling a tool, capture it here for retry/prompting
+  llmTextResponse?: string;
 }
 
 // === Reminder ===
@@ -62,6 +61,8 @@ export interface TurnWorkingState {
   currentTool: string | undefined;
   groupToolResults: ToolEvent[];
   reminders: Reminder[];
+  failedTools: string[];  // Accumulated failed tool names this session
+  executeRetryCount: number;  // Retry counter for text-only responses in EXECUTE
 
   // Tool selection consensus (set by SELECT_TOOL, read by REFLECT)
   lastToolSelectionResult?: {

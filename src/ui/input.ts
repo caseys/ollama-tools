@@ -9,6 +9,29 @@ let speechInterruptListener: (() => void) | undefined;
 let voicePendingResolve: ((result: InputResult) => void) | undefined;
 let lastStreamingLength = 0;
 
+// Track the current stdin listener for pause/resume during clarification prompts
+let currentStdinListener: (() => void) | undefined;
+
+/**
+ * Pause the main input's stdin listener.
+ * Call this before starting a clarification prompt to avoid conflicts.
+ */
+export function pauseMainInputListener(): void {
+  if (currentStdinListener) {
+    stdin.removeListener("data", currentStdinListener);
+  }
+}
+
+/**
+ * Resume the main input's stdin listener.
+ * Call this after a clarification prompt completes.
+ */
+export function resumeMainInputListener(): void {
+  if (currentStdinListener) {
+    stdin.on("data", currentStdinListener);
+  }
+}
+
 export function setVoiceBusy(busy: boolean): void {
   voiceBusy = busy;
 }
@@ -38,10 +61,14 @@ export async function getNextInput(rl: ReadlineInterface): Promise<InputResult> 
         }, 80);
       }
     };
+
+    // Store reference so it can be paused during clarification prompts
+    currentStdinListener = stripLeadingSpace;
     stdin.on("data", stripLeadingSpace);
 
     void rl.question("you> ").then((text: string) => {
       stdin.removeListener("data", stripLeadingSpace);
+      currentStdinListener = undefined;  // Clear reference after cleanup
       if (voicePendingResolve === resolve) {
         voicePendingResolve = undefined;
         resolve({ source: "keyboard", text: text.trimStart() });

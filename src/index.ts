@@ -218,13 +218,20 @@ async function main(): Promise<void> {
       resultLog: loggers.resultLog,
       say: maybeSay,
       sayResult: maybeSayResult,
-      // Interactive mode: prompt user for clarification via readline
+      // Interactive mode: prompt user for clarification via voice or keyboard
       promptUser: async (question: string) => {
         spinner.stop();
         output.write(`\n❓ ${question}\n`);
         void maybeSay(question);
-        const answer = await rl.question("clarify> ");
-        return answer.trim();
+        maybeEnableSpeechInterrupt();
+        // Use getNextInput to support both voice and keyboard input
+        setVoiceBusy(false);
+        const { source, text } = await getNextInput(rl);
+        setVoiceBusy(true);
+        if (source === "voice") {
+          output.write(`clarify> ${text}\n`);
+        }
+        return text;
       },
     };
 
