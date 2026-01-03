@@ -1,6 +1,6 @@
 import type { Interface as ReadlineInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { hear, say } from "hear-say";
+import { hear, say, setHearMuted, isHearMuted } from "hear-say";
 import type { InputResult } from "../types.js";
 import type { Logger } from "./logger.js";
 
@@ -10,7 +10,7 @@ let voicePendingResolve: ((result: InputResult) => void) | undefined;
 let lastStreamingLength = 0;
 
 // Track the current stdin listener for pause/resume during clarification prompts
-let currentStdinListener: (() => void) | undefined;
+let currentStdinListener: ((data: Buffer) => void) | undefined;
 
 /**
  * Pause the main input's stdin listener.
@@ -47,15 +47,41 @@ export async function getNextInput(rl: ReadlineInterface): Promise<InputResult> 
   return new Promise((resolve) => {
     voicePendingResolve = resolve;
 
-    // Strip leading spaces in real-time as user types
-    const stripLeadingSpace = (): void => {
+    // Handle keystrokes in real-time as user types
+    const handleKeystroke = (data: Buffer): void => {
+      const key = data.toString();
       const line = (rl as unknown as { line: string }).line;
+
+      // Handle backtick: toggle mute
+      if (key === "`") {
+        const nowMuted = !isHearMuted();
+        setHearMuted(nowMuted);
+
+        // Remove backtick from line buffer
+        if (line.endsWith("`")) {
+          stdout.write("\b \b");
+          (rl as unknown as { line: string }).line = line.slice(0, -1);
+        }
+
+        // Visual feedback: replace "you" with MUTED/LISTENING
+        const indicator = nowMuted ? "MUTED" : "LISTENING";
+        const currentLine = (rl as unknown as { line: string }).line;
+        stdout.write(`\r\u001B[7m${indicator}>\u001B[0m ${currentLine}`);
+        setTimeout(() => {
+          const line = (rl as unknown as { line: string }).line;
+          // Clear the line and restore normal prompt
+          stdout.write(`\r${" ".repeat(indicator.length + 2 + line.length)}\ryou> ${line}`);
+        }, 2000);
+        return;
+      }
+
+      // Strip leading spaces
       if (line && line.startsWith(" ")) {
         // Backspace to remove the space visually
         stdout.write("\b \b");
         (rl as unknown as { line: string }).line = line.slice(1);
         // Flash the prompt
-        stdout.write("\r\x1b[7myou> \x1b[0m");
+        stdout.write("\r\u001B[7myou> \u001B[0m");
         setTimeout(() => {
           stdout.write("\ryou> ");
         }, 80);
@@ -63,11 +89,11 @@ export async function getNextInput(rl: ReadlineInterface): Promise<InputResult> 
     };
 
     // Store reference so it can be paused during clarification prompts
-    currentStdinListener = stripLeadingSpace;
-    stdin.on("data", stripLeadingSpace);
+    currentStdinListener = handleKeystroke;
+    stdin.on("data", handleKeystroke);
 
     void rl.question("you> ").then((text: string) => {
-      stdin.removeListener("data", stripLeadingSpace);
+      stdin.removeListener("data", handleKeystroke);
       currentStdinListener = undefined;  // Clear reference after cleanup
       if (voicePendingResolve === resolve) {
         voicePendingResolve = undefined;
