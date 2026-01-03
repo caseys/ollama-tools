@@ -204,16 +204,17 @@ async function getRemainingQuery(
 
   const prompt = `${context}
 
-TASK: What specific action remains to complete the original request?
+TASK: What work remains to complete the original request?
 
 Original: "${state.originalQuery}"
-Completed work is listed in COMPLETED WORK above.${clarificationNote}
+Completed work is listed in MISSION PROGRESS above.${clarificationNote}
 
-IMPORTANT: Reply with the SPECIFIC remaining action, not a summary.
+RULES:
+- Keep the original phrasing, just remove completed parts
+- Preserve multi-step sequences (e.g., "warp to SOI, then circularize")
 - If everything is done, reply with exactly: NONE
-- Otherwise reply with the remaining task (e.g., "land on the Mun")
 
-DO NOT reply with meta-commentary. Only the task or NONE.`;
+Reply with the remaining work only. No commentary.`;
 
   const result = await callLLM(
     deps.ollamaClient,
