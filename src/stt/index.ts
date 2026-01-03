@@ -1,16 +1,8 @@
 /**
- * STT (Speech-to-Text) pre-processing module.
+ * STT (Speech-to-Text) dictionary module.
  *
- * Provides phonetic matching for STT correction using known terms
- * from tool catalog and status resource.
- *
- * Fully abstract - no domain-specific hardcoding.
+ * Builds a dictionary for hear-say phonetic correction from
+ * tool catalog and status resource.
  */
 
-export { preprocessSttInput, type PreprocessResult } from "./preprocessor.js";
-export {
-  buildFromToolCatalog,
-  buildFromStatusText,
-  combineDictionaries,
-  type DictionaryEntry,
-} from "./dictionary.js";
+export { buildDictionary } from "./build-dictionary.js";

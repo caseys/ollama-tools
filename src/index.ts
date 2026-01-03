@@ -29,6 +29,9 @@ import {
   sayResult,
   enableSpeechInterrupt,
 } from "./ui/input.js";
+import { setDictionary } from "hear-say";
+import { fetchStatusInfo } from "./mcp/resources.js";
+import { buildDictionary } from "./stt/build-dictionary.js";
 
 async function main(): Promise<void> {
   const { config, prompt: cliPrompt } = parseConfig();
@@ -79,6 +82,16 @@ async function main(): Promise<void> {
   // Initialize voice listener only if speech is enabled
   if (config.speechEnabled) {
     initVoiceListener(loggers.agentLog);
+
+    // Build STT dictionary from tools and status for hear-say phonetic correction
+    const { statusInfo } = await fetchStatusInfo(
+      client,
+      { agentLog: loggers.agentLog, agentWarn: loggers.agentWarn },
+      "Dictionary "
+    );
+    const dictionary = buildDictionary(toolInventory, statusInfo);
+    setDictionary(dictionary);
+    loggers.agentLog(`[agent] STT dictionary: ${dictionary.length} terms`);
   }
 
   // Create conditional speech functions (no-op when disabled)

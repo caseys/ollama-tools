@@ -3,9 +3,10 @@
  *
  * Runs ONCE at the beginning of each turn, before SELECT_TOOL.
  * Responsibilities:
- * 1. Fix speech-to-text errors using TOOL names and STATUS context
- * 2. Combine with previous interpreted requests (if history exists)
- * 3. Route: proceed to tools, respond directly, or ask for clarification
+ * 1. Combine with previous interpreted requests (if history exists)
+ * 2. Route: proceed to tools, respond directly, or ask for clarification
+ *
+ * Note: STT correction is handled by hear-say library via dictionary set at init.
  */
 
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -18,7 +19,6 @@ import type { TurnInput, TurnWorkingState } from "../core/turn-types.js";
 import { fetchStatusInfo } from "../mcp/resources.js";
 import { runWithConsensus } from "../core/consensus.js";
 import type { SamplingParams } from "../core/retry.js";
-import { preprocessSttInput } from "../stt/index.js";
 
 // === Helpers ===
 
@@ -70,34 +70,6 @@ export type InterpretResult =
 
 // === Prompt Builders ===
 
-function buildRewritePrompt(
-  userInput: string,
-  toolInventory: InventoryEntry[],
-  agentPrompts: AgentPrompts,
-  statusInfo: string
-): OllamaMessage[] {
-  const toolNames = formatToolNames(toolInventory);
-
-  const system = `${agentPrompts.roleForAssistant}
-
-TOOLS: ${toolNames}
-
-STATUS:
-${statusInfo || "No status available."}
-
-TASK: Rewrite the user's request exactly as intended, fixing speech-to-text errors.
-
-RULES:
-1. Replace similar-sounding words with TOOL names or STATUS elements that make sense in context
-2. Keep the request sentence structure intact - only fix misheard words
-3. If nothing needs fixing, return the request unchanged
-4. Examples: "author eyes" → "authorize", "cube or net ease" → "Kubernetes", "get hub" → "GitHub
-
-Return ONLY the corrected request, no explanation or commentary.`;
-
-  return [{ role: "system", content: system }, { role: "user", content: userInput }];
-}
-
 function buildCombinePrompt(
   correctedQuery: string,
   interpretHistory: string[]
@@ -148,37 +120,6 @@ Reply with just the keyword and content, nothing else.`;
 }
 
 // === Query Execution ===
-
-async function runRewriteQuery(
-  messages: OllamaMessage[],
-  deps: InterpretDeps
-): Promise<string> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => { controller.abort(); }, 30_000);
-
-  try {
-    const response = await deps.ollamaClient.callWithSignal(
-      messages,
-      [],
-      controller.signal,
-      {
-        options: { temperature: 0.3 },
-        silent: true,
-        spinnerMessage: "Interpreting",
-      }
-    );
-    clearTimeout(timeoutId);
-
-    const text = response.message?.content?.trim() ?? "";
-    deps.agentLog(`[interpret] LLM rewrite: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`);
-    return text;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    deps.agentWarn(`[interpret] Rewrite failed: ${error instanceof Error ? error.message : String(error)}`);
-    // Return original input on failure
-    return messages[0]?.content ?? "";
-  }
-}
 
 async function runCombineQuery(
   messages: OllamaMessage[],
@@ -300,61 +241,21 @@ export async function interpret(
   );
   state.cachedStatusInfo = statusInfo;
 
-  // === Step 0: Pre-process STT input (voice only) ===
-  let processedInput = input.userInput;
-  if (input.inputSource === "voice") {
-    const result = preprocessSttInput(
-      input.userInput,
-      deps.toolInventory,
-      statusInfo
-    );
-    // Log debug info
-    for (const line of result.debugLog) {
-      deps.agentLog(`[interpret] STT: ${line}`);
-    }
-    if (result.text !== input.userInput) {
-      deps.agentLog(`[interpret] STT corrected: "${result.text.slice(0, 100)}${result.text.length > 100 ? "..." : ""}"`);
-      processedInput = result.text;
-    } else {
-      deps.agentLog("[interpret] STT: no corrections needed");
-    }
-  }
+  // Use input directly - hear-say handles STT correction via dictionary
+  const correctedQuery = input.userInput;
 
-  // === Step 1: Rewrite query to fix STT errors ===
-  deps.spinner.start("Interpreting");
-
-  const rewriteMessages = buildRewritePrompt(
-    processedInput,
-    deps.toolInventory,
-    deps.agentPrompts,
-    statusInfo
-  );
-
-  deps.toLLMLog("[toLLM] ─── Interpret: Rewrite Prompt ───");
-  deps.toLLMLog(rewriteMessages[0]?.content ?? "");
-  deps.toLLMLog("\n[user]");
-  deps.toLLMLog(rewriteMessages[1]?.content ?? "");
-
-  let correctedQuery = await runRewriteQuery(rewriteMessages, deps);
-
-  // Fallback to original if rewrite returned empty
-  if (!correctedQuery.trim()) {
-    correctedQuery = input.userInput;
-    deps.agentLog("[interpret] Rewrite returned empty, using original");
-  }
-
-  // === Shortcut: If rewrite is exactly a tool name, skip to execute ===
+  // === Shortcut: If input is exactly a tool name, skip to execute ===
   const exactToolMatch = findExactToolMatch(correctedQuery, deps.toolInventory);
   if (exactToolMatch) {
     deps.agentLog(`[interpret] Exact tool match: "${exactToolMatch}" - skipping to execute`);
     return { action: "execute", tool: exactToolMatch, interpretedQuery: exactToolMatch };
   }
 
-  // === Step 2: Combine with history (if exists) ===
+  // === Combine with history (if exists) ===
   let finalQuery = correctedQuery;
 
   if (state.interpretHistory && state.interpretHistory.length > 0) {
-    deps.spinner.update("Combining context");
+    deps.spinner.start("Combining context");
 
     const combineMessages = buildCombinePrompt(correctedQuery, state.interpretHistory);
 
@@ -373,8 +274,8 @@ export async function interpret(
     }
   }
 
-  // === Step 3: Route decision ===
-  deps.spinner.update("Routing");
+  // === Route decision ===
+  deps.spinner.start("Routing");
 
   const routeMessages = buildRoutePrompt(
     finalQuery,

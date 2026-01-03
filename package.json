@@ -14,7 +14,7 @@
     "lint:old": "eslint agent.js",
     "typecheck": "tsc --noEmit",
     "knip": "knip",
-    "pho": "tsx src/test-phonetics.ts"
+    "test-phonetics": "tsx src/test-phonetics.ts"
   },
   "keywords": [
     "ollama",
@@ -27,11 +27,12 @@
     "@modelcontextprotocol/sdk": "^1.24.3",
     "dotenv": "^16.4.5",
     "hear-say": "file:../hear-say",
-    "phonetics": "^1.0.7"
+    "stopword": "^3.1.5"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
     "@types/node": "^22.0.0",
+    "@types/stopword": "^2.0.3",
     "eslint": "^9.39.2",
     "eslint-plugin-unicorn": "^62.0.0",
     "globals": "^16.5.0",

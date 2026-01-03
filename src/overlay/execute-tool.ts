@@ -94,10 +94,10 @@ YOUR ONLY JOB: Call "${tool.name}" with arguments from the query below.
 CRITICAL: You MUST call "${tool.name}".  Or as a last resort:respond with clarifying question for user.
 
 RULES:
-1. Call ${tool.name} - extract arguments from the query.
+1. Call ${tool.name} - extract arguments from the user query.
 2. Ignore parts of the user query that don't map to this tool's parameters. Later steps handle those.
-3. Only include arguments explicitly stated or clearly implied. Omit optional args not mentioned.
-4. If unsure about a required argument, use defaults or make a reasonable guess.`;
+3. Only include arguments explicitly stated or clearly implied.
+4. Do not fabricate arguments. Prefer default/missing arguments over made-up ones.`;
 
   return { system, user: userQuery };
 }
