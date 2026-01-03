@@ -18,6 +18,7 @@ import type { TurnInput, TurnWorkingState } from "../core/turn-types.js";
 import { fetchStatusInfo } from "../mcp/resources.js";
 import { runWithConsensus } from "../core/consensus.js";
 import type { SamplingParams } from "../core/retry.js";
+import { preprocessSttInput } from "../stt/index.js";
 
 // === Helpers ===
 
@@ -169,7 +170,7 @@ async function runRewriteQuery(
     clearTimeout(timeoutId);
 
     const text = response.message?.content?.trim() ?? "";
-    deps.agentLog(`[interpret] Rewritten: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`);
+    deps.agentLog(`[interpret] LLM rewrite: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`);
     return text;
   } catch (error) {
     clearTimeout(timeoutId);
@@ -299,11 +300,31 @@ export async function interpret(
   );
   state.cachedStatusInfo = statusInfo;
 
+  // === Step 0: Pre-process STT input (voice only) ===
+  let processedInput = input.userInput;
+  if (input.inputSource === "voice") {
+    const result = preprocessSttInput(
+      input.userInput,
+      deps.toolInventory,
+      statusInfo
+    );
+    // Log debug info
+    for (const line of result.debugLog) {
+      deps.agentLog(`[interpret] STT: ${line}`);
+    }
+    if (result.text !== input.userInput) {
+      deps.agentLog(`[interpret] STT corrected: "${result.text.slice(0, 100)}${result.text.length > 100 ? "..." : ""}"`);
+      processedInput = result.text;
+    } else {
+      deps.agentLog("[interpret] STT: no corrections needed");
+    }
+  }
+
   // === Step 1: Rewrite query to fix STT errors ===
   deps.spinner.start("Interpreting");
 
   const rewriteMessages = buildRewritePrompt(
-    input.userInput,
+    processedInput,
     deps.toolInventory,
     deps.agentPrompts,
     statusInfo
