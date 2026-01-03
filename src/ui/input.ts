@@ -3,6 +3,7 @@ import { stdin, stdout } from "node:process";
 import { hear, say, setHearMuted, isHearMuted } from "hear-say";
 import type { InputResult } from "../types.js";
 import type { Logger } from "./logger.js";
+import type { TerminalUI } from "./terminal.js";
 
 let voiceBusy = true;
 let speechInterruptListener: (() => void) | undefined;
@@ -43,11 +44,29 @@ export function formatToolListForSpeech(tools: string[]): string {
   return readable.slice(0, -1).join(", ") + " and " + readable.at(-1)!;
 }
 
-export async function getNextInput(rl: ReadlineInterface): Promise<InputResult> {
+// Module-level terminalUI reference for voice streaming
+let activeTerminalUI: TerminalUI | undefined;
+
+export async function getNextInput(rl: ReadlineInterface, terminalUI?: TerminalUI): Promise<InputResult> {
+  // Store for voice streaming to use
+  activeTerminalUI = terminalUI;
+
   return new Promise((resolve) => {
     voicePendingResolve = resolve;
 
-    // Handle keystrokes in real-time as user types
+    // Enhanced mode: use terminal-kit's inputField
+    if (terminalUI?.isEnhancedMode()) {
+      void terminalUI.getInput("you> ").then((text: string) => {
+        if (voicePendingResolve === resolve) {
+          voicePendingResolve = undefined;
+          activeTerminalUI = undefined;
+          resolve({ source: "keyboard", text: text.trimStart() });
+        }
+      });
+      return;
+    }
+
+    // Simple mode: use readline with keystroke handling
     const handleKeystroke = (data: Buffer): void => {
       const key = data.toString();
       const line = (rl as unknown as { line: string }).line;
@@ -97,6 +116,7 @@ export async function getNextInput(rl: ReadlineInterface): Promise<InputResult> 
       currentStdinListener = undefined;  // Clear reference after cleanup
       if (voicePendingResolve === resolve) {
         voicePendingResolve = undefined;
+        activeTerminalUI = undefined;
         resolve({ source: "keyboard", text: text.trimStart() });
       }
     });
@@ -111,7 +131,13 @@ export function initVoiceListener(agentLog: Logger): void {
       // Streaming update - show on you> line, replacing previous
       if (!voiceBusy && voicePendingResolve) {
         const line = `you> ${trimmed}`;
-        stdout.write(`\r${line}${" ".repeat(Math.max(0, lastStreamingLength - line.length))}`);
+
+        // Use terminalUI if in enhanced mode, otherwise direct stdout
+        if (activeTerminalUI?.isEnhancedMode()) {
+          activeTerminalUI.writeToInputLine(line);
+        } else {
+          stdout.write(`\r${line}${" ".repeat(Math.max(0, lastStreamingLength - line.length))}`);
+        }
         lastStreamingLength = line.length;
       }
       return;
@@ -119,7 +145,11 @@ export function initVoiceListener(agentLog: Logger): void {
 
     // Final result - clear the streaming line first
     if (lastStreamingLength > 0) {
-      stdout.write(`\r${" ".repeat(lastStreamingLength)}\r`);
+      if (activeTerminalUI?.isEnhancedMode()) {
+        activeTerminalUI.clearInputLine();
+      } else {
+        stdout.write(`\r${" ".repeat(lastStreamingLength)}\r`);
+      }
       lastStreamingLength = 0;
     }
 

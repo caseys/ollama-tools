@@ -8,6 +8,7 @@ import { parseConfig } from "./config/parser.js";
 import { HISTORY_RESULT_TEXT_LIMIT } from "./config/constants.js";
 import { createLoggers } from "./ui/logger.js";
 import { createSpinner } from "./ui/spinner.js";
+import { createTerminalUI } from "./ui/terminal.js";
 import { blankLine, separator } from "./ui/output.js";
 import { createOllamaClient } from "./core/ollama.js";
 import { connectToMcp } from "./mcp/client.js";
@@ -35,8 +36,16 @@ import { buildDictionary } from "./stt/build-dictionary.js";
 
 async function main(): Promise<void> {
   const { config, prompt: cliPrompt } = parseConfig();
-  const loggers = createLoggers(config.debug);
-  const spinner = createSpinner(config.debug, loggers.agentLog, { raiseHand });
+
+  // Create terminal UI - enhanced mode only for interactive TTY (not --prompt mode)
+  const useEnhancedUI = !cliPrompt && process.stdout.isTTY;
+  const terminalUI = createTerminalUI(useEnhancedUI, config.debug);
+
+  // Initialize terminal UI (sets up split pane in enhanced mode)
+  await terminalUI.init();
+
+  const loggers = createLoggers(config.debug, terminalUI);
+  const spinner = createSpinner(config.debug, loggers.agentLog, { raiseHand, terminalUI });
 
   const ollamaClient = createOllamaClient({
     config,
@@ -110,6 +119,7 @@ async function main(): Promise<void> {
       stopVoiceListener();
     }
     rl.close();
+    terminalUI.cleanup();
     try {
       await transport.close();
     } catch {
@@ -155,9 +165,9 @@ async function main(): Promise<void> {
 
     const turnOutput = await runTurn(turnInput, machineDeps);
     loggers.agentLog(`[agent] Result: branch=${turnOutput.branch}`);
-    loggers.assistantLog(turnOutput.response);
+    console.log(turnOutput.response);  // Direct output, no "you>" UI
     await shutdown();
-    return;
+    process.exit(turnOutput.branch === "satisfied" ? 0 : 1);
   }
 
   // Interactive mode
@@ -180,12 +190,17 @@ async function main(): Promise<void> {
     let inputSource: "keyboard" | "voice" = "keyboard";
     try {
       setVoiceBusy(false);
-      const { source, text } = await getNextInput(rl);
+      const { source, text } = await getNextInput(rl, terminalUI);
       setVoiceBusy(true);
       userInput = text;
       inputSource = source;
       if (source === "voice") {
-        output.write(`you> ${text}\n`);
+        // Echo voice input to output (use terminalUI in enhanced mode)
+        if (terminalUI.isEnhancedMode()) {
+          terminalUI.writeLine(`you> ${text}`);
+        } else {
+          output.write(`you> ${text}\n`);
+        }
       }
     } catch (error) {
       if (error && typeof error === "object") {
@@ -237,15 +252,23 @@ async function main(): Promise<void> {
       // Interactive mode: prompt user for clarification via voice or keyboard
       promptUser: async (question: string) => {
         spinner.stop();
-        output.write(`\n❓ ${question}\n`);
+        if (terminalUI.isEnhancedMode()) {
+          terminalUI.writeLine(`\n❓ ${question}`);
+        } else {
+          output.write(`\n❓ ${question}\n`);
+        }
         void maybeSay(question);
         maybeEnableSpeechInterrupt();
         // Use getNextInput to support both voice and keyboard input
         setVoiceBusy(false);
-        const { source, text } = await getNextInput(rl);
+        const { source, text } = await getNextInput(rl, terminalUI);
         setVoiceBusy(true);
         if (source === "voice") {
-          output.write(`clarify> ${text}\n`);
+          if (terminalUI.isEnhancedMode()) {
+            terminalUI.writeLine(`clarify> ${text}`);
+          } else {
+            output.write(`clarify> ${text}\n`);
+          }
         }
         return text;
       },

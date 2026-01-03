@@ -1,6 +1,7 @@
 import process from "node:process";
 import { SPINNER_FRAMES } from "../config/constants.js";
 import type { Logger } from "./logger.js";
+import type { TerminalUI } from "./terminal.js";
 
 export interface Spinner {
   start: (message: string) => void;
@@ -10,6 +11,7 @@ export interface Spinner {
 
 export interface SpinnerDeps {
   raiseHand?: (text: string) => void;
+  terminalUI?: TerminalUI;
 }
 
 export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: SpinnerDeps): Spinner {
@@ -17,22 +19,33 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
   let spinnerIndex = 0;
   let currentMessage = "";
 
+  const terminalUI = deps?.terminalUI;
+  const useEnhanced = terminalUI?.isEnhancedMode() ?? false;
+
   function start(message: string): void {
     if (message !== currentMessage) {
       currentMessage = message;
       deps?.raiseHand?.(message);
     }
     if (debugMode) return;
+
     stop();
     spinnerIndex = 0;
-    spinnerInterval = setInterval(() => {
-      const frame = SPINNER_FRAMES[spinnerIndex++ % SPINNER_FRAMES.length];
-      process.stdout.write(`\r${frame} ${currentMessage}...`);
-    }, 80);
+
+    if (useEnhanced && terminalUI) {
+      terminalUI.startSpinner(message);
+    } else {
+      spinnerInterval = setInterval(() => {
+        const frame = SPINNER_FRAMES[spinnerIndex++ % SPINNER_FRAMES.length];
+        process.stdout.write(`\r${frame} ${currentMessage}...`);
+      }, 80);
+    }
   }
 
   function stop(): void {
-    if (spinnerInterval) {
+    if (useEnhanced && terminalUI) {
+      terminalUI.stopSpinner();
+    } else if (spinnerInterval !== undefined) {
       clearInterval(spinnerInterval);
       spinnerInterval = undefined;
       process.stdout.write("\r\u001B[K");
@@ -44,11 +57,17 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
       currentMessage = message;
       deps?.raiseHand?.(message);
     }
-    if (spinnerInterval && !debugMode) {
+
+    if (debugMode) {
+      agentLog(`[Progress] ${message}`);
+      return;
+    }
+
+    if (useEnhanced && terminalUI) {
+      terminalUI.updateSpinner(message);
+    } else if (spinnerInterval !== undefined) {
       const frame = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length];
       process.stdout.write(`\r\u001B[K${frame} ${message}`);
-    } else if (debugMode) {
-      agentLog(`[Progress] ${message}`);
     }
   }
 

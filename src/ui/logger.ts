@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 import { COLOR_CODES, ENABLE_COLOR, type ColorCode } from "../config/constants.js";
+import type { TerminalUI } from "./terminal.js";
 
 const LOG_FILE = process.env["LOG_FILE"];
 let logStream: fs.WriteStream | undefined;
@@ -37,7 +38,8 @@ export function makeLogger(
   method: ConsoleMethod,
   color: ColorCode | undefined,
   isDebugOnly: boolean,
-  debugMode: boolean
+  debugMode: boolean,
+  terminalUI?: TerminalUI
 ): Logger {
   return (message: string, ...rest: unknown[]): void => {
     const fullMessage =
@@ -45,7 +47,10 @@ export function makeLogger(
     writeToLogFile(fullMessage);
 
     if (!isDebugOnly || debugMode) {
-      if (rest.length > 0) {
+      // Use terminalUI if available and in enhanced mode, otherwise console
+      if (terminalUI?.isEnhancedMode()) {
+        terminalUI.writeLine(fullMessage, color);
+      } else if (rest.length > 0) {
         console[method](colorize(message, color), ...rest);
       } else {
         console[method](colorize(message, color));
@@ -60,7 +65,8 @@ export interface ToolLogger {
 
 export function makeToolLogger(
   direction: "to" | "from",
-  debugMode: boolean
+  debugMode: boolean,
+  terminalUI?: TerminalUI
 ): ToolLogger {
   const colorCode =
     direction === "to" ? COLOR_CODES.toTool : COLOR_CODES.fromTool;
@@ -73,7 +79,9 @@ export function makeToolLogger(
     writeToLogFile(fullMessage);
 
     if (debugMode) {
-      if (rest.length > 0) {
+      if (terminalUI?.isEnhancedMode()) {
+        terminalUI.writeLine(fullMessage, colorCode);
+      } else if (rest.length > 0) {
         console.log(colorize(formatted, colorCode), ...rest);
       } else {
         console.log(colorize(formatted, colorCode));
@@ -86,15 +94,22 @@ export interface ResultLogger {
   (toolName: string, success: boolean, result: string): void;
 }
 
-export function makeResultLogger(): ResultLogger {
+export function makeResultLogger(terminalUI?: TerminalUI): ResultLogger {
   return function (toolName: string, success: boolean, result: string): void {
     const icon = success ? "\u2713" : "\u2717";
     const colorCode = success ? COLOR_CODES.fromTool : COLOR_CODES.error;
     const header = `${icon} ${toolName}`;
-    console.log(colorize(header, colorCode));
-    // Print each non-empty line of result
-    for (const line of result.split("\n").filter(l => l.trim())) {
-      console.log(colorize(`  ${line}`, colorCode));
+
+    if (terminalUI?.isEnhancedMode()) {
+      terminalUI.writeLine(header, colorCode);
+      for (const line of result.split("\n").filter(l => l.trim())) {
+        terminalUI.writeLine(`  ${line}`, colorCode);
+      }
+    } else {
+      console.log(colorize(header, colorCode));
+      for (const line of result.split("\n").filter(l => l.trim())) {
+        console.log(colorize(`  ${line}`, colorCode));
+      }
     }
   };
 }
@@ -111,16 +126,16 @@ export interface Loggers {
   resultLog: ResultLogger;
 }
 
-export function createLoggers(debugMode: boolean): Loggers {
+export function createLoggers(debugMode: boolean, terminalUI?: TerminalUI): Loggers {
   return {
-    agentLog: makeLogger("log", COLOR_CODES.toHuman, true, debugMode),
-    agentWarn: makeLogger("warn", COLOR_CODES.warn, true, debugMode),
-    agentError: makeLogger("error", COLOR_CODES.error, false, debugMode),
-    fromLLMLog: makeLogger("log", COLOR_CODES.fromLLM, true, debugMode),
-    toLLMLog: makeLogger("log", COLOR_CODES.toLLM, true, debugMode),
-    assistantLog: makeLogger("log", COLOR_CODES.fromLLM, false, debugMode),
-    toToolLog: makeToolLogger("to", debugMode),
-    fromToolLog: makeToolLogger("from", debugMode),
-    resultLog: makeResultLogger(),
+    agentLog: makeLogger("log", COLOR_CODES.toHuman, true, debugMode, terminalUI),
+    agentWarn: makeLogger("warn", COLOR_CODES.warn, true, debugMode, terminalUI),
+    agentError: makeLogger("error", COLOR_CODES.error, false, debugMode, terminalUI),
+    fromLLMLog: makeLogger("log", COLOR_CODES.fromLLM, true, debugMode, terminalUI),
+    toLLMLog: makeLogger("log", COLOR_CODES.toLLM, true, debugMode, terminalUI),
+    assistantLog: makeLogger("log", COLOR_CODES.fromLLM, false, debugMode, terminalUI),
+    toToolLog: makeToolLogger("to", debugMode, terminalUI),
+    fromToolLog: makeToolLogger("from", debugMode, terminalUI),
+    resultLog: makeResultLogger(terminalUI),
   };
 }
