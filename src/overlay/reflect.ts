@@ -235,12 +235,18 @@ async function getSummary(
 
 TASK: Summarize what THIS MISSION accomplished.
 
-RULES:
-- Summarize only what the tools in MISSION PROGRESS did
-- For informational tools (status, get_*): say what info was shown
-- Do NOT describe past missions
+CRITICAL CONTEXT:
+- STATUS shows the current game state (cumulative result of ALL past missions)
+- MISSION PROGRESS shows ONLY the tools called during THIS mission
+- Your summary must describe ONLY actions from MISSION PROGRESS, not game state
 
-Reply with 1-2 sentences.`;
+RULES:
+1. ONLY describe tools listed in MISSION PROGRESS above
+2. If MISSION PROGRESS shows "(none yet)", say "No actions were taken"
+3. Do NOT infer actions from STATUS - that's historical context, not current work
+4. For informational tools (status, get_*): describe what info was retrieved
+
+Reply with 1-2 sentences about THIS mission only.`;
 
   const result = await callLLM(
     deps.ollamaClient,
