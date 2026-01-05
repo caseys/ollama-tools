@@ -86,7 +86,8 @@ async function main(): Promise<void> {
     return agentPrompts;
   };
 
-  const rl = readline.createInterface({ input, output });
+  // Only create readline for simple mode - enhanced mode uses terminal-kit exclusively
+  const rl = useEnhancedUI ? undefined : readline.createInterface({ input, output });
 
   // Initialize voice listener only if speech is enabled
   if (config.speechEnabled) {
@@ -106,7 +107,9 @@ async function main(): Promise<void> {
   // Create conditional speech functions (no-op when disabled)
   const maybeSay = config.speechEnabled ? say : () => {};
   const maybeSayResult = config.speechEnabled ? sayResult : () => {};
-  const maybeEnableSpeechInterrupt = config.speechEnabled ? enableSpeechInterrupt : () => {};
+  const maybeEnableSpeechInterrupt = config.speechEnabled
+    ? () => enableSpeechInterrupt(terminalUI)
+    : () => {};
 
   let shuttingDown = false;
   const commandHistory: Array<HistoryEntry & { fullResponse?: string }> = [];
@@ -118,7 +121,7 @@ async function main(): Promise<void> {
     if (config.speechEnabled) {
       stopVoiceListener();
     }
-    rl.close();
+    rl?.close();
     terminalUI.cleanup();
     try {
       await transport.close();

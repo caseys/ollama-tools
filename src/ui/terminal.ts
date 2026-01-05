@@ -8,6 +8,7 @@
 
 import process from "node:process";
 import termKit from "terminal-kit";
+import { setHearMuted, isHearMuted, say } from "hear-say";
 import { SPINNER_FRAMES, COLOR_CODES, ENABLE_COLOR, type ColorCode } from "../config/constants.js";
 
 const { terminal: term } = termKit;
@@ -28,6 +29,12 @@ export interface TerminalUI {
 
   /** Write a line to the output pane (scrollable area) */
   writeLine(text: string, color?: ColorCode): void;
+
+  /** Write a line with emphasis (inverse styling for visibility) */
+  writeEmphasis(text: string, color?: ColorCode): void;
+
+  /** Write a line with underline styling (for headers) */
+  writeUnderline(text: string, color?: ColorCode): void;
 
   /** Write multiple lines to output pane */
   writeLines(lines: string[], color?: ColorCode): void;
@@ -86,6 +93,16 @@ class SimpleTerminalUI implements TerminalUI {
     }
   }
 
+  writeEmphasis(text: string, color?: ColorCode): void {
+    // Simple mode: fall back to regular writeLine
+    this.writeLine(text, color);
+  }
+
+  writeUnderline(text: string, color?: ColorCode): void {
+    // Simple mode: fall back to regular writeLine
+    this.writeLine(text, color);
+  }
+
   writeLines(lines: string[], color?: ColorCode): void {
     for (const line of lines) {
       this.writeLine(line, color);
@@ -139,6 +156,7 @@ class SimpleTerminalUI implements TerminalUI {
 
 class EnhancedTerminalUI implements TerminalUI {
   private outputEndRow = 0;  // Last row of scrolling region
+  private separatorRow = 0;  // Row for visual separator
   private inputRow = 0;
   private spinnerInterval: ReturnType<typeof setInterval> | undefined;
   private spinnerIndex = 0;
@@ -156,26 +174,49 @@ class EnhancedTerminalUI implements TerminalUI {
   async init(): Promise<void> {
     if (this.initialized) return;
 
-    // Layout: scrolling region rows 1 to (height-1), input prompt at height
-    // No separator - keeps it simple like the working pattern
-    this.outputEndRow = term.height - 1;
+    // Layout: scrolling region rows 1 to (height-2), separator at (height-1), input at height
+    this.outputEndRow = term.height - 2;
+    this.separatorRow = term.height - 1;
     this.inputRow = term.height;
 
     // Clear screen and set up scrolling region for output area
     term.clear();
     term.scrollingRegion(1, this.outputEndRow);
 
+    // Draw the separator line
+    this.drawSeparator();
+
     // Enable raw mode for input
     term.grabInput(true);
 
+    // Handle key events
+    term.on("key", (key: string) => {
+      // Ctrl+C exits
+      if (key === "CTRL_C") {
+        this.cleanup();
+        process.exit(0);
+      }
+      // Any keypress stops active speech
+      void say(false);
+    });
+
     // Handle terminal resize
     term.on("resize", (_width: number, height: number) => {
-      this.outputEndRow = height - 1;
+      this.outputEndRow = height - 2;
+      this.separatorRow = height - 1;
       this.inputRow = height;
       term.scrollingRegion(1, this.outputEndRow);
+      this.drawSeparator();
     });
 
     this.initialized = true;
+  }
+
+  private drawSeparator(): void {
+    term.saveCursor();
+    term.moveTo(1, this.separatorRow);
+    term.gray("─".repeat(term.width));
+    term.restoreCursor();
   }
 
   private writeTextWithColor(text: string, color?: ColorCode): void {
@@ -215,8 +256,12 @@ class EnhancedTerminalUI implements TerminalUI {
       if (this.inputFieldController) {
         this.inputFieldController.abort();
       }
-      term.scrollingRegion(1, term.height);  // Reset to full screen
+      // Reset terminal state completely
+      term.removeAllListeners("key");
+      term.removeAllListeners("resize");
       term.grabInput(false);
+      term.styleReset();
+      process.stdout.write("\x1b[r");  // Reset scrolling region (ANSI escape)
       term.moveTo(1, term.height);
       term("\n");
     }
@@ -242,10 +287,56 @@ class EnhancedTerminalUI implements TerminalUI {
     term.restoreCursor();
   }
 
+  writeEmphasis(text: string, color?: ColorCode): void {
+    if (!this.initialized) {
+      console.log(text);
+      return;
+    }
+
+    term.saveCursor();
+    term.moveTo(1, this.outputEndRow);
+    term("\n");
+    term.inverse();
+    this.writeTextWithColor(text, color);
+    term.styleReset();
+    term.restoreCursor();
+  }
+
+  writeUnderline(text: string, color?: ColorCode): void {
+    if (!this.initialized) {
+      console.log(text);
+      return;
+    }
+
+    term.saveCursor();
+    term.moveTo(1, this.outputEndRow);
+    term("\n");
+    term.underline();
+    this.writeTextWithColor(text, color);
+    term.styleReset();
+    term.restoreCursor();
+  }
+
   writeLines(lines: string[], color?: ColorCode): void {
     for (const line of lines) {
       this.writeLine(line, color);
     }
+  }
+
+  private showMuteIndicator(muted: boolean): void {
+    const indicator = muted ? "MUTED" : "LISTENING";
+    term.saveCursor();
+    term.moveTo(1, this.separatorRow);
+    term.inverse();
+    term(` ${indicator} `);
+    term.styleReset();
+    term.gray("─".repeat(term.width - indicator.length - 2));
+    term.restoreCursor();
+
+    // Restore normal separator after delay
+    setTimeout(() => {
+      this.drawSeparator();
+    }, 2000);
   }
 
   async getInput(prompt: string): Promise<string> {
@@ -253,26 +344,54 @@ class EnhancedTerminalUI implements TerminalUI {
     const fullPrompt = this.currentPrefix ? `${this.currentPrefix}${prompt}` : prompt;
 
     return new Promise((resolve) => {
-      // Position cursor at input line and write prompt
-      term.moveTo(1, this.inputRow);
-      term.eraseLine();
-      term.cyan(fullPrompt);
+      const startInput = (): void => {
+        // Position cursor at input line and write prompt (bold for visibility)
+        term.moveTo(1, this.inputRow);
+        term.eraseLine();
+        term.bold.cyan(fullPrompt);
 
-      // inputField handles the actual input after the prompt
-      this.inputFieldController = term.inputField({
-        history: this.inputHistory,
-      }, (error: Error | undefined, input: string | undefined) => {
-        this.inputFieldController = undefined;
-        if (!error && input !== undefined) {
-          // Add to history if non-empty
-          if (input.trim()) {
-            this.inputHistory.push(input);
+        // inputField with custom key bindings for backtick
+        // NOTE: Adding keyBindings seems to override defaults, so we must preserve them
+        this.inputFieldController = term.inputField({
+          history: this.inputHistory,
+          keyBindings: {
+            BACKQUOTE: "custom",      // Backtick for mute toggle
+            ENTER: "submit",
+            BACKSPACE: "backDelete",
+            DELETE: "delete",
+            LEFT: "backward",
+            RIGHT: "forward",
+            UP: "historyPrevious",
+            DOWN: "historyNext",
+            HOME: "startOfInput",
+            END: "endOfInput",
+            TAB: "autoComplete",
+          },
+        }, (error: Error | undefined, input: string | undefined, info?: { key?: string }) => {
+          // Handle custom keys
+          if (info?.key === "BACKQUOTE") {
+            const nowMuted = !isHearMuted();
+            setHearMuted(nowMuted);
+            this.showMuteIndicator(nowMuted);
+            startInput();  // Restart input after handling
+            return;
           }
-          resolve(input);
-        } else {
-          resolve("");  // Return empty on error/abort
-        }
-      });
+
+          // Normal submit
+          this.inputFieldController = undefined;
+          if (!error && input !== undefined) {
+            // Add to history if non-empty
+            if (input.trim()) {
+              this.inputHistory.push(input);
+            }
+            resolve(input);
+          } else {
+            resolve("");  // Return empty on error/abort
+          }
+        });
+      };
+
+      startInput();
     });
   }
 

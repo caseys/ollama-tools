@@ -47,14 +47,14 @@ export function formatToolListForSpeech(tools: string[]): string {
 // Module-level terminalUI reference for voice streaming
 let activeTerminalUI: TerminalUI | undefined;
 
-export async function getNextInput(rl: ReadlineInterface, terminalUI?: TerminalUI): Promise<InputResult> {
+export async function getNextInput(rl: ReadlineInterface | undefined, terminalUI?: TerminalUI): Promise<InputResult> {
   // Store for voice streaming to use
   activeTerminalUI = terminalUI;
 
   return new Promise((resolve) => {
     voicePendingResolve = resolve;
 
-    // Enhanced mode: use terminal-kit's inputField
+    // Enhanced mode: use terminal-kit's inputField exclusively
     if (terminalUI?.isEnhancedMode()) {
       void terminalUI.getInput("you> ").then((text: string) => {
         if (voicePendingResolve === resolve) {
@@ -67,6 +67,10 @@ export async function getNextInput(rl: ReadlineInterface, terminalUI?: TerminalU
     }
 
     // Simple mode: use readline with keystroke handling
+    if (!rl) {
+      throw new Error("readline required for simple mode");
+    }
+
     const handleKeystroke = (data: Buffer): void => {
       const key = data.toString();
       const line = (rl as unknown as { line: string }).line;
@@ -171,7 +175,11 @@ export function stopVoiceListener(): void {
   hear(false);
 }
 
-export function enableSpeechInterrupt(): void {
+export function enableSpeechInterrupt(terminalUI?: TerminalUI): void {
+  // In enhanced mode, terminal-kit's grabInput handles stdin - adding our own
+  // listener causes conflicts (triggers immediately). Skip in enhanced mode.
+  if (terminalUI?.isEnhancedMode()) return;
+
   if (speechInterruptListener) return;
 
   speechInterruptListener = (): void => {

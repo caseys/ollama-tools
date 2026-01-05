@@ -216,6 +216,10 @@ RULES:
 
 Reply with the remaining work only. No commentary.`;
 
+  // Log the remaining query prompt for debugging
+  deps.toLLMLog("[toLLM] ─── Reflect RemainingQuery Prompt ───");
+  deps.toLLMLog(prompt);
+
   const result = await callLLM(
     deps.ollamaClient,
     [{ role: "system", content: prompt }],
@@ -247,6 +251,10 @@ RULES:
 4. For informational tools (status, get_*): describe what info was retrieved
 
 Reply with 1-2 sentences about THIS mission only.`;
+
+  // Log the summary prompt for debugging
+  deps.toLLMLog("[toLLM] ─── Reflect Summary Prompt ───");
+  deps.toLLMLog(prompt);
 
   const result = await callLLM(
     deps.ollamaClient,
@@ -286,6 +294,10 @@ Reply with the question only.`;
   const prompt = `${context}
 
 ${taskPrompt}`;
+
+  // Log the question prompt for debugging
+  deps.toLLMLog("[toLLM] ─── Reflect Question Prompt ───");
+  deps.toLLMLog(prompt);
 
   const result = await callLLM(
     deps.ollamaClient,

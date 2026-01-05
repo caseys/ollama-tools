@@ -101,7 +101,7 @@ export function makeResultLogger(terminalUI?: TerminalUI): ResultLogger {
     const header = `${icon} ${toolName}`;
 
     if (terminalUI?.isEnhancedMode()) {
-      terminalUI.writeLine(header, colorCode);
+      terminalUI.writeUnderline(header, colorCode);
       for (const line of result.split("\n").filter(l => l.trim())) {
         terminalUI.writeLine(`  ${line}`, colorCode);
       }
