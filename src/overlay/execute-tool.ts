@@ -59,7 +59,8 @@ function buildFocusedToolPrompt(
   maxIterations: number,
   agentPrompts: AgentPrompts,
   statusInfo: string | undefined,
-  retryContext?: { previousError: string }
+  retryContext?: { previousError: string },
+  lastToolError?: string
 ): ToolPromptResult {
   const tool = toolEntry.openAi.function;
   const parameterHints = formatParameterHints(tool);
@@ -76,9 +77,14 @@ function buildFocusedToolPrompt(
     ? `\n\n⚠️ RETRY: This tool just failed with:\n${retryContext.previousError}\n\nFix the arguments based on this error.`
     : "";
 
+  // Tool error section (when LLM refused to call the tool on previous attempt)
+  const toolErrorSection = lastToolError
+    ? `\n\nTOOL ERROR (previous attempt):\n${lastToolError.slice(0, 200)}\n\n⚠️ You MUST call "${tool.name}" this time. Fix your arguments based on this error.`
+    : "";
+
   const system = `${agentPrompts.roleForAssistant}
 
-${pipelineInfo}${previousContext}${retryWarning}
+${pipelineInfo}${previousContext}${retryWarning}${toolErrorSection}
 
 TOOL: ${tool.name}
 ${tool.description}${parameterHints ? `
@@ -218,7 +224,8 @@ export async function executeTool(
     state.maxIterations,
     deps.agentPrompts,
     statusInfo,
-    retryContext
+    retryContext,
+    state.lastToolError
   );
 
   // Get arguments via LLM

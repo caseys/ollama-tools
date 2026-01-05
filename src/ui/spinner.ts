@@ -27,7 +27,6 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
       currentMessage = message;
       deps?.raiseHand?.(message);
     }
-    if (debugMode) return;
 
     stop();
     spinnerIndex = 0;
@@ -56,11 +55,6 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
     if (message !== currentMessage) {
       currentMessage = message;
       deps?.raiseHand?.(message);
-    }
-
-    if (debugMode) {
-      agentLog(`[Progress] ${message}`);
-      return;
     }
 
     if (useEnhanced && terminalUI) {

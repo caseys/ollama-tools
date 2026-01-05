@@ -13,6 +13,7 @@ export const COLOR_CODES = {
   toHuman: "\u001B[36m", // cyan - agent status for operator
   warn: "\u001B[35m",
   error: "\u001B[31m",
+  gray: "\u001B[90m", // gray - spinner history
 } as const;
 
 export type ColorCode = (typeof COLOR_CODES)[keyof typeof COLOR_CODES];

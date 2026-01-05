@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import process from "node:process";
-import readline from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
+import { stdout as output } from "node:process";
 
 import { parseConfig } from "./config/parser.js";
 import { HISTORY_RESULT_TEXT_LIMIT } from "./config/constants.js";
@@ -86,8 +85,6 @@ async function main(): Promise<void> {
     return agentPrompts;
   };
 
-  // Only create readline for simple mode - enhanced mode uses terminal-kit exclusively
-  const rl = useEnhancedUI ? undefined : readline.createInterface({ input, output });
 
   // Initialize voice listener only if speech is enabled
   if (config.speechEnabled) {
@@ -121,7 +118,6 @@ async function main(): Promise<void> {
     if (config.speechEnabled) {
       stopVoiceListener();
     }
-    rl?.close();
     terminalUI.cleanup();
     try {
       await transport.close();
@@ -193,17 +189,15 @@ async function main(): Promise<void> {
     let inputSource: "keyboard" | "voice" = "keyboard";
     try {
       setVoiceBusy(false);
-      const { source, text } = await getNextInput(rl, terminalUI);
+      const { source, text } = await getNextInput(terminalUI);
       setVoiceBusy(true);
       userInput = text;
       inputSource = source;
-      if (source === "voice") {
-        // Echo voice input to output (use terminalUI in enhanced mode)
-        if (terminalUI.isEnhancedMode()) {
-          terminalUI.writeLine(`you> ${text}`);
-        } else {
-          output.write(`you> ${text}\n`);
-        }
+      // Echo all input to scrolling area (creates visible command history)
+      if (terminalUI.isEnhancedMode()) {
+        terminalUI.writeLine(`you> ${text}`);
+      } else {
+        output.write(`you> ${text}\n`);
       }
     } catch (error) {
       if (error && typeof error === "object") {
@@ -264,7 +258,7 @@ async function main(): Promise<void> {
         maybeEnableSpeechInterrupt();
         // Use getNextInput to support both voice and keyboard input
         setVoiceBusy(false);
-        const { source, text } = await getNextInput(rl, terminalUI);
+        const { source, text } = await getNextInput(terminalUI);
         setVoiceBusy(true);
         if (source === "voice") {
           if (terminalUI.isEnhancedMode()) {

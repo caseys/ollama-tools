@@ -63,6 +63,7 @@ export interface TurnWorkingState {
   reminders: Reminder[];
   failedTools: string[];  // Accumulated failed tool names this session
   executeRetryCount: number;  // Retry counter for text-only responses in EXECUTE
+  lastToolError?: string;  // LLM text response when it refused to call tool (for TOOL ERROR section)
 
   // Tool selection consensus (set by SELECT_TOOL, read by REFLECT)
   lastToolSelectionResult?: {

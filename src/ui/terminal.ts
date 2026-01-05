@@ -2,7 +2,7 @@
  * Terminal UI abstraction layer.
  *
  * Provides two implementations:
- * - SimpleTerminalUI: Basic console output (for --prompt mode or piped output)
+ * - SimpleTerminalUI: Basic console output (for --prompt mode, non-interactive)
  * - EnhancedTerminalUI: Split-pane with terminal-kit (interactive TTY mode)
  */
 
@@ -61,7 +61,7 @@ export interface TerminalUI {
   writeToInputLine(text: string): void;
 }
 
-// === Simple Terminal UI (current behavior wrapper) ===
+// === Simple Terminal UI (--prompt mode only, non-interactive) ===
 
 class SimpleTerminalUI implements TerminalUI {
   private spinnerInterval: ReturnType<typeof setInterval> | undefined;
@@ -78,7 +78,7 @@ class SimpleTerminalUI implements TerminalUI {
   }
 
   async init(): Promise<void> {
-    // No initialization needed for simple mode
+    // No initialization needed for --prompt mode
   }
 
   cleanup(): void {
@@ -94,12 +94,10 @@ class SimpleTerminalUI implements TerminalUI {
   }
 
   writeEmphasis(text: string, color?: ColorCode): void {
-    // Simple mode: fall back to regular writeLine
     this.writeLine(text, color);
   }
 
   writeUnderline(text: string, color?: ColorCode): void {
-    // Simple mode: fall back to regular writeLine
     this.writeLine(text, color);
   }
 
@@ -110,14 +108,11 @@ class SimpleTerminalUI implements TerminalUI {
   }
 
   getInput(_prompt: string): Promise<string> {
-    // This is a placeholder - actual input is handled by readline in index.ts
-    // The SimpleTerminalUI doesn't take over input handling
-    return Promise.reject(new Error("SimpleTerminalUI.getInput should not be called directly"));
+    throw new Error("Interactive input not available in --prompt mode");
   }
 
   startSpinner(message: string): void {
-    if (this.debugMode) return;
-    this.stopSpinner();
+    this.stopSpinner();  // Logs previous message if any
     this.currentMessage = message;
     this.spinnerIndex = 0;
     this.spinnerInterval = setInterval(() => {
@@ -128,6 +123,11 @@ class SimpleTerminalUI implements TerminalUI {
 
   stopSpinner(): void {
     if (this.spinnerInterval !== undefined) {
+      // Log final message before stopping (gray)
+      if (this.currentMessage) {
+        this.writeLine(`⠿ ${this.currentMessage}`, COLOR_CODES.gray);
+        this.currentMessage = "";
+      }
       clearInterval(this.spinnerInterval);
       this.spinnerInterval = undefined;
       process.stdout.write("\r\u001B[K");
@@ -135,19 +135,22 @@ class SimpleTerminalUI implements TerminalUI {
   }
 
   updateSpinner(message: string): void {
+    // Log previous message if changing (gray)
+    if (message !== this.currentMessage && this.currentMessage) {
+      this.writeLine(`⠿ ${this.currentMessage}`, COLOR_CODES.gray);
+    }
     this.currentMessage = message;
-    if (this.spinnerInterval && !this.debugMode) {
+    if (this.spinnerInterval) {
       const frame = SPINNER_FRAMES[this.spinnerIndex % SPINNER_FRAMES.length];
       process.stdout.write(`\r\u001B[K${frame} ${message}`);
     }
   }
 
   clearInputLine(): void {
-    // No-op in simple mode - handled by readline
+    // No-op in --prompt mode (no interactive input)
   }
 
   writeToInputLine(text: string): void {
-    // In simple mode, just write to stdout
     process.stdout.write(text);
   }
 }
@@ -166,6 +169,7 @@ class EnhancedTerminalUI implements TerminalUI {
   private currentPrefix = "";  // Current prefix for inputField (includes spinner when active)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private inputFieldController: any;  // Controller returned by inputField for aborting
+  private backtickPressed = false;  // Flag for backtick mute toggle
 
   isEnhancedMode(): boolean {
     return true;
@@ -195,6 +199,17 @@ class EnhancedTerminalUI implements TerminalUI {
       if (key === "CTRL_C") {
         this.cleanup();
         process.exit(0);
+      }
+      // Backtick toggles mute - abort inputField to prevent character appearing
+      if (key === "`") {
+        const nowMuted = !isHearMuted();
+        setHearMuted(nowMuted);
+        this.showMuteIndicator(nowMuted);
+        this.backtickPressed = true;
+        if (this.inputFieldController) {
+          this.inputFieldController.abort();
+        }
+        return;
       }
       // Any keypress stops active speech
       void say(false);
@@ -243,6 +258,9 @@ class EnhancedTerminalUI implements TerminalUI {
           return;
         case COLOR_CODES.error:
           term.red(text);
+          return;
+        case COLOR_CODES.gray:
+          term.gray(text);
           return;
       }
     }
@@ -350,12 +368,10 @@ class EnhancedTerminalUI implements TerminalUI {
         term.eraseLine();
         term.bold.cyan(fullPrompt);
 
-        // inputField with custom key bindings for backtick
-        // NOTE: Adding keyBindings seems to override defaults, so we must preserve them
+        // inputField with explicit key bindings (adding any keyBindings overrides defaults)
         this.inputFieldController = term.inputField({
           history: this.inputHistory,
           keyBindings: {
-            BACKQUOTE: "custom",      // Backtick for mute toggle
             ENTER: "submit",
             BACKSPACE: "backDelete",
             DELETE: "delete",
@@ -367,18 +383,17 @@ class EnhancedTerminalUI implements TerminalUI {
             END: "endOfInput",
             TAB: "autoComplete",
           },
-        }, (error: Error | undefined, input: string | undefined, info?: { key?: string }) => {
-          // Handle custom keys
-          if (info?.key === "BACKQUOTE") {
-            const nowMuted = !isHearMuted();
-            setHearMuted(nowMuted);
-            this.showMuteIndicator(nowMuted);
-            startInput();  // Restart input after handling
+        }, (error: Error | undefined, input: string | undefined) => {
+          this.inputFieldController = undefined;
+
+          // Check if aborted due to backtick - restart input
+          if (this.backtickPressed) {
+            this.backtickPressed = false;
+            startInput();
             return;
           }
 
           // Normal submit
-          this.inputFieldController = undefined;
           if (!error && input !== undefined) {
             // Add to history if non-empty
             if (input.trim()) {
@@ -396,7 +411,7 @@ class EnhancedTerminalUI implements TerminalUI {
   }
 
   startSpinner(message: string): void {
-    this.stopSpinner();
+    this.stopSpinner();  // Logs previous message if any
     this.currentSpinnerMessage = message;
     this.spinnerIndex = 0;
 
@@ -415,6 +430,11 @@ class EnhancedTerminalUI implements TerminalUI {
 
   stopSpinner(): void {
     if (this.spinnerInterval !== undefined) {
+      // Log final message before stopping (gray)
+      if (this.currentSpinnerMessage) {
+        this.writeLine(`⠿ ${this.currentSpinnerMessage}`, COLOR_CODES.gray);
+        this.currentSpinnerMessage = "";
+      }
       clearInterval(this.spinnerInterval);
       this.spinnerInterval = undefined;
       this.currentPrefix = "";
@@ -430,6 +450,10 @@ class EnhancedTerminalUI implements TerminalUI {
   }
 
   updateSpinner(message: string): void {
+    // Log previous message to scrolling area if changing (gray)
+    if (message !== this.currentSpinnerMessage && this.currentSpinnerMessage) {
+      this.writeLine(`⠿ ${this.currentSpinnerMessage}`, COLOR_CODES.gray);
+    }
     this.currentSpinnerMessage = message;
     // The interval will pick up the new message on next tick
   }

@@ -109,6 +109,8 @@ function formatPreviousResults(toolResults: ToolEvent[]): string {
   return `\nMISSION PROGRESS:\n${entries.join("\n\n")}`;
 }
 
+
+
 function buildSelectToolPrompt(
   remainingQuery: string,
   previousResults: ToolEvent[],
@@ -117,7 +119,8 @@ function buildSelectToolPrompt(
   toolInventory: InventoryEntry[],
   agentPrompts: AgentPrompts,
   historySummary: string,
-  statusInfo: string
+  statusInfo: string,
+  lastToolError?: string
 ): OllamaMessage[] {
   const previousContext = formatPreviousResults(previousResults);
 
@@ -125,7 +128,13 @@ function buildSelectToolPrompt(
   const lastFailure = previousResults.filter(e => !e.success).at(-1);
   const lastFailureNote = lastFailure
     ? `\n⚠️ LAST FAILURE: ${lastFailure.toolName} - may need different arguments if retrying`
-    : '';
+    : "";
+
+
+  // Tool error section (when LLM refused to call the selected tool)
+  const toolErrorSection = lastToolError
+    ? `\n\nTOOL ERROR:\n${lastToolError.slice(0, 200)}\n\n⚠️ The previously selected tool could not be called. Consider selecting a different tool.`
+    : "";
 
   const system = `${agentPrompts.roleForAssistant}
 
@@ -137,7 +146,7 @@ ${statusInfo || "No status available."}
 
 HISTORY (previous sessions):
 ${historySummary || "This is the first request."}
-${previousContext}
+${previousContext}${toolErrorSection}
 ${lastFailureNote}
 
 ITERATION: ${iteration}/${maxIterations}
@@ -260,7 +269,8 @@ export async function selectTool(
     deps.toolInventory,
     deps.agentPrompts,
     historySummary,
-    statusInfo
+    statusInfo,
+    state.lastToolError
   );
 
   deps.toLLMLog("[toLLM] ─── Select Tool Prompt ───");

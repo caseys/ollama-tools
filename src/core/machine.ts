@@ -236,9 +236,9 @@ export async function runTurn(
           state.executeRetryCount++;
 
           if (state.executeRetryCount < MAX_EXECUTE_RETRIES) {
-            // Retry - add context about the failure
+            // Retry - store error for TOOL ERROR section (don't pollute remainingQuery)
             deps.agentLog(`[machine] LLM text response, retry ${state.executeRetryCount}/${MAX_EXECUTE_RETRIES}`);
-            state.remainingQuery = `[Previous attempt returned text: "${toolEvent.llmTextResponse.slice(0, 100)}"]\n\n${state.remainingQuery}`;
+            state.lastToolError = toolEvent.llmTextResponse;
             // Stay in EXECUTE with same currentTool
             break;
           }
@@ -254,8 +254,9 @@ export async function runTurn(
           break;
         }
 
-        // Reset retry count on successful tool call
+        // Reset retry count and clear error on successful tool call
         state.executeRetryCount = 0;
+        delete state.lastToolError;
 
         // Normal flow - add to results and go to reflect
         state.groupToolResults.push(toolEvent);
