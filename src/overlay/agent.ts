@@ -3,6 +3,7 @@ import type { AgentPromptsLazy } from "../types.js";
 import type { Logger } from "../ui/logger.js";
 import type { OllamaClient } from "../core/ollama.js";
 import type { InventoryEntry } from "../utils/tools.js";
+import { getTier1ToolNames } from "../utils/tools.js";
 import { truncateMiddle, extractAssistantText } from "../utils/strings.js";
 import { fetchStatusInfo, type ResourceReaderDeps } from "../mcp/resources.js";
 
@@ -16,7 +17,7 @@ export async function generateAgentPrompts(
   client: Client,
   deps: GenerateAgentPromptsDeps
 ): Promise<AgentPromptsLazy> {
-  const toolNames = toolInventory.map((t) => t.openAi.function.name).join(", ");
+  const toolNames = getTier1ToolNames(toolInventory);
 
   deps.agentLog("[agent] Reading status resource for intro context...");
   const { statusInfo } = await fetchStatusInfo(client, deps, "Intro ");
@@ -67,5 +68,5 @@ Create a role title that describes your work with these TOOLS.`;
     return text;
   });
 
-  return { roleForUser, roleForAssistantPromise };
+  return { roleForUser, roleForAssistantPromise, statusInfo };
 }

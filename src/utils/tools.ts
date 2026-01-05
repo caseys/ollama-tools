@@ -7,37 +7,25 @@ export interface InventoryEntry {
   parameterKeys: string[];
 }
 
-export function getCommonTools(toolInventory: InventoryEntry[]): InventoryEntry[] {
-  return toolInventory.filter((t) => (t.tier ?? 2) <= 2);
+export function getTier1Tools(toolInventory: InventoryEntry[]): InventoryEntry[] {
+  return toolInventory.filter((t) => t.tier === 1);
 }
 
-export function getOtherTools(toolInventory: InventoryEntry[]): InventoryEntry[] {
-  return toolInventory.filter((t) => (t.tier ?? 2) > 2);
-}
-
-export function getCommonToolNames(toolInventory: InventoryEntry[]): string {
-  return getCommonTools(toolInventory)
+export function getTier1ToolNames(toolInventory: InventoryEntry[]): string {
+  return getTier1Tools(toolInventory)
     .map((t) => t.openAi.function.name)
     .join(", ");
 }
 
 export function formatToolsByTier(toolInventory: InventoryEntry[]): string {
-  const tier1and2 = getCommonTools(toolInventory);
-  const otherTools = getOtherTools(toolInventory);
+  const tier1 = getTier1Tools(toolInventory);
 
   const lines: string[] = [];
 
-  if (tier1and2.length > 0) {
-    for (const t of tier1and2) {
-      lines.push(
-        `- ${t.openAi.function.name}: ${t.openAi.function.description || "No description"}`
-      );
-    }
-  }
-
-  if (otherTools.length > 0) {
-    const otherNames = otherTools.map((t) => t.openAi.function.name).join(", ");
-    lines.push(`- Other tools: ${otherNames}`);
+  for (const t of tier1) {
+    lines.push(
+      `- ${t.openAi.function.name}: ${t.openAi.function.description || "No description"}`
+    );
   }
 
   return lines.join("\n");

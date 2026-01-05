@@ -72,9 +72,6 @@ export interface TurnWorkingState {
     queriesRun: number;
   };
 
-  // Interpret history (previous interpreted queries, persisted across turns)
-  interpretHistory?: string[];
-
   // Cached status info (cleared after tool execution)
   cachedStatusInfo?: string;
 }
@@ -87,7 +84,6 @@ export interface TurnOutput {
   response: string;
   stateSummary: string;
   branch: TurnBranch;
-  interpretedQuery?: string | undefined;  // The interpreted query for this turn (to persist in history)
 }
 
 // === Reflection Decision ===
@@ -105,7 +101,6 @@ export type { HistoryEntry, HistoryToolEvent } from "../utils/history.js";
 
 export enum MachineState {
   WAIT_USER = "WAIT_USER",
-  INTERPRET = "INTERPRET",
   SELECT_TOOL = "SELECT_TOOL",
   EXECUTE = "EXECUTE",
   REFLECT_SUMMARIZE = "REFLECT_SUMMARIZE",

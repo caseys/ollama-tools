@@ -70,7 +70,7 @@ async function main(): Promise<void> {
   }
 
   loggers.agentLog("[agent] Generating agent prompts from tool catalog...");
-  const { roleForUser, roleForAssistantPromise } = await generateAgentPrompts(toolInventory, client, {
+  const { roleForUser, roleForAssistantPromise, statusInfo: startupStatusInfo } = await generateAgentPrompts(toolInventory, client, {
     ollamaClient,
     agentLog: loggers.agentLog,
     agentWarn: loggers.agentWarn,
@@ -110,7 +110,6 @@ async function main(): Promise<void> {
 
   let shuttingDown = false;
   const commandHistory: Array<HistoryEntry & { fullResponse?: string }> = [];
-  const interpretHistory: string[] = [];  // Interpreted queries across turns
 
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
@@ -144,7 +143,6 @@ async function main(): Promise<void> {
       toolInventory,
       agentPrompts: await getAgentPrompts(),
       history: [],
-      interpretHistory: [],  // Single-prompt mode: no history
       spinner,
       agentLog: loggers.agentLog,
       agentWarn: loggers.agentWarn,
@@ -160,6 +158,7 @@ async function main(): Promise<void> {
         loggers.agentWarn(`[agent] ask_user in single-prompt mode: "${question}" - returning empty`);
         return "";
       },
+      cachedStatus: startupStatusInfo,
     };
 
     const turnOutput = await runTurn(turnInput, machineDeps);
@@ -235,7 +234,6 @@ async function main(): Promise<void> {
       toolInventory,
       agentPrompts: await getAgentPrompts(),
       history: commandHistory,
-      interpretHistory,
       spinner,
       agentLog: loggers.agentLog,
       agentWarn: loggers.agentWarn,
@@ -246,6 +244,7 @@ async function main(): Promise<void> {
       resultLog: loggers.resultLog,
       say: maybeSay,
       sayResult: maybeSayResult,
+      cachedStatus: startupStatusInfo,
       // Interactive mode: prompt user for clarification via voice or keyboard
       promptUser: async (question: string) => {
         spinner.stop();
@@ -292,12 +291,6 @@ async function main(): Promise<void> {
         ),
         fullResponse: turnOutput.response,
       });
-
-      // Persist interpreted query to history for future context
-      if (turnOutput.interpretedQuery) {
-        interpretHistory.push(turnOutput.interpretedQuery);
-        loggers.agentLog(`[agent] Added to interpret history: "${turnOutput.interpretedQuery.slice(0, 50)}..."`);
-      }
     } catch (error) {
       spinner.stop();
       loggers.agentError(`[agent] Failed to get answer: ${describeError(error)}`);

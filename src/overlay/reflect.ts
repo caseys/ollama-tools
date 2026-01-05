@@ -325,6 +325,7 @@ export async function reflectAndSummarize(
     deps.agentLog("[reflect] Using cached status");
     statusInfo = state.cachedStatusInfo;
   } else {
+    deps.spinner.start("Reading status");
     const result = await fetchStatusInfo(
       deps.client,
       { agentLog: deps.agentLog, agentWarn: deps.agentWarn },

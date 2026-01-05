@@ -211,6 +211,7 @@ export async function executeTool(
     deps.agentLog("[execute] Using cached status");
     statusInfo = state.cachedStatusInfo;
   } else {
+    deps.spinner.start("Reading status");
     const result = await fetchStatusInfo(deps.client, { agentLog: deps.agentLog, agentWarn: deps.agentWarn }, "Execute ");
     statusInfo = result.statusInfo;
     state.cachedStatusInfo = statusInfo;

@@ -245,9 +245,9 @@ export async function selectTool(
   // Use cached status or fetch fresh
   let statusInfo: string;
   if (state.cachedStatusInfo !== undefined) {
-    deps.agentLog("[select] Using cached status");
     statusInfo = state.cachedStatusInfo;
   } else {
+    deps.spinner.start("Reading status");
     const result = await fetchStatusInfo(
       deps.client,
       { agentLog: deps.agentLog, agentWarn: deps.agentWarn },

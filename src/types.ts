@@ -143,6 +143,7 @@ export interface AgentPrompts {
 export interface AgentPromptsLazy {
   roleForUser: string;
   roleForAssistantPromise: Promise<string>;
+  statusInfo: string;
 }
 
 export interface PreflightResult {
