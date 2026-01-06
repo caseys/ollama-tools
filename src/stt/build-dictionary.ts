@@ -10,6 +10,21 @@ import type { DictionaryEntry } from "hear-say";
 import type { InventoryEntry } from "../utils/tools.js";
 
 /**
+ * Check if a term is a valid speakable word for STT.
+ * Filters out pure numbers, symbols, and technical codes.
+ */
+function isValidTerm(term: string): boolean {
+  // Must have at least 3 letters
+  const letterCount = (term.match(/[a-zA-Z]/g) ?? []).length;
+  if (letterCount < 3) return false;
+
+  // Filter out technical error codes (all caps with numbers/underscores)
+  if (/^[A-Z][A-Z0-9_]+$/.test(term) && term.length > 6) return false;
+
+  return true;
+}
+
+/**
  * Tokenize text into words, splitting on common delimiters.
  */
 function tokenize(text: string): string[] {
@@ -45,7 +60,7 @@ export function buildDictionary(
 
   const add = (term: string, weight: number): void => {
     const lower = term.toLowerCase();
-    if (!seen.has(lower) && term.length >= 3) {
+    if (!seen.has(lower) && term.length >= 3 && isValidTerm(term)) {
       seen.add(lower);
       entries.push({ term, weight });
     }
