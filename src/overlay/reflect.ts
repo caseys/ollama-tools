@@ -1,9 +1,10 @@
 /**
  * Reflect step: evaluates tool results and decides next action.
  *
- * Uses two sequential LLM calls with simple string responses:
- * 1. Decision call: CONTINUE, DONE, or ASK
- * 2. Follow-up call: remainingQuery, summary, or question
+ * Uses a single LLM call that outputs one of:
+ * - DONE: all goals satisfied
+ * - ASK: <question>: needs user clarification
+ * - <remaining work>: what still needs to be done
  */
 
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -16,8 +17,6 @@ import type { TurnInput, TurnWorkingState, ReflectionDecision, ToolEvent } from 
 import { callLLM } from "../core/services.js";
 import { fetchStatusInfo } from "../mcp/resources.js";
 import { formatToolsByTier } from "../utils/tools.js";
-import { runWithConsensus } from "../core/consensus.js";
-import type { SamplingParams } from "../core/retry.js";
 
 // === Dependencies ===
 
@@ -100,131 +99,63 @@ ${statusInfo || "No status available."}
 ITERATION: ${state.iteration}/${state.maxIterations}`;
 }
 
-// === Decision Call ===
+// === Main Reflect Call ===
 
-type Decision = "continue" | "done" | "ask";
-
-function parseDecision(raw: string): Decision {
-  const lower = raw.toLowerCase();
-
-  // Explicit done indicators - must say done/complete/satisfied
-  if (lower.includes("done") || lower.includes("satisfied") || lower === "complete") {
-    return "done";
-  }
-
-  // Ask indicators
-  if (lower.includes("ask") || lower.includes("clarif")) {
-    return "ask";
-  }
-
-  // Everything else (including "continue", ambiguous responses) → continue
-  // This is safer for multi-step tasks
-  return "continue";
-}
-
-async function getDecision(
-  context: string,
-  deps: ReflectDeps
-): Promise<Decision> {
-  const prompt = `${context}
-
-TASK: Is the ORIGINAL REQUEST **fully** satisfied?
-
-CRITICAL: Evaluate the ENTIRE original request, not just individual steps.
-- "create and deploy" requires BOTH actions, not just one
-- "search and replace" requires BOTH actions, not just one
-- If TOOL SELECTION shows "no tool needed" with high consensus, the task is likely complete.
-- If multiple tools have FAILED (see ⚠️ FAILURES above), choose ASK to get user help.
-
-Reply with exactly ONE word:
-- CONTINUE - More work remains (request is NOT fully complete)
-- DONE - The ENTIRE request is fully satisfied
-- ASK - Cannot proceed without user clarification (USE THIS if tools keep failing)`;
-
-  // Log the reflect prompt for debugging
-  deps.toLLMLog("[toLLM] ─── Reflect Decision Prompt ───");
-  deps.toLLMLog(prompt);
-
-  let queryIndex = 0;
-  const consensusResult = await runWithConsensus<Decision>(
-    async (params: SamplingParams) => {
-      queryIndex++;
-      deps.spinner.update(`Reflecting (${queryIndex})`);
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30_000);
-
-      try {
-        const result = await deps.ollamaClient.callWithSignal(
-          [{ role: "system", content: prompt }],
-          [],
-          controller.signal,
-          {
-            options: { temperature: params.temperature, stop: ["\n"] },
-            silent: true,
-          }
-        );
-        clearTimeout(timeoutId);
-
-        const raw = result.message?.content?.trim() ?? "";
-        deps.agentLog(`[reflect] Query (temp=${params.temperature}): "${raw}"`);
-
-        return parseDecision(raw);
-      } catch (error) {
-        clearTimeout(timeoutId);
-        deps.agentWarn(`[reflect] Query failed (temp=${params.temperature}): ${error instanceof Error ? error.message : String(error)}`);
-        return null;
-      }
-    },
-    (a, b) => a === b,
-    { maxQueries: 3, minMatches: 2, matchMode: "exact" }
-  );
-
-  // Log consensus results
-  for (const [index, result] of consensusResult.allResults.entries()) {
-    deps.agentLog(`[reflect] Query ${index + 1}: ${result}`);
-  }
-  deps.agentLog(`[reflect] Consensus: ${consensusResult.matchCount}/${consensusResult.queriesRun} → ${consensusResult.result ?? "none"}`);
-
-  return consensusResult.result ?? "continue";
-}
-
-// === Follow-up Calls ===
-
+/**
+ * Determine remaining work, or if done/needs clarification.
+ * Returns one of:
+ * - "DONE" - all goals satisfied
+ * - "ASK: <question>" - needs user clarification
+ * - "<remaining work>" - what still needs to be done
+ */
 async function getRemainingQuery(
   context: string,
   state: TurnWorkingState,
   deps: ReflectDeps
 ): Promise<string> {
-  // Check if remainingQuery has clarification context that needs stripping
-  const hasClarification = state.remainingQuery.includes("[User clarified");
-  const clarificationNote = hasClarification
-    ? `\nNote: Strip any "[User clarified...]" lines - that context was for a completed tool call.`
+  // Include last successful tool result for advice extraction
+  const lastSuccess = state.groupToolResults.filter(e => e.success).at(-1);
+  const toolAdviceSection = lastSuccess
+    ? `\nLAST TOOL OUTPUT (${lastSuccess.toolName}):\n${lastSuccess.result.slice(0, 500)}`
     : "";
 
-  const prompt = `${context}
+  // Check for failures that might need user help
+  const failures = state.groupToolResults.filter((e) => !e.success);
+  const failureSection = failures.length > 0
+    ? `\n\n⚠️ FAILURES: ${failures.map(f => f.toolName).join(", ")} - if stuck, ask the user for help`
+    : "";
 
-TASK: What work remains to complete the original request?
+  const user = `TASK: Determine what work remains to complete the original request.
 
-Original: "${state.originalQuery}"
-Completed work is listed in MISSION PROGRESS above.${clarificationNote}
+ORIGINAL REQUEST: "${state.originalQuery}"
+${toolAdviceSection}${failureSection}
 
 RULES:
-- Keep the original phrasing, just remove completed parts
-- Preserve multi-step sequences (e.g., "warp to SOI, then circularize")
-- If everything is done, reply with exactly: NONE
+- Verify goals against STATUS and MISSION PROGRESS
+- A tool completing ✓ does NOT mean the goal is achieved
+- Check MISSION PROGRESS for suggested next steps from tool outputs
+- If multiple tools keep failing, ask the user for help
 
-Reply with the remaining work only. No commentary.`;
+OUTPUT (one of):
+- DONE - if all goals in original request are satisfied per STATUS
+- ASK: <question> - if you need user clarification
+- <remaining work> - what still needs to be done`;
 
-  // Log the remaining query prompt for debugging
-  deps.toLLMLog("[toLLM] ─── Reflect RemainingQuery Prompt ───");
-  deps.toLLMLog(prompt);
+  // Log the prompts for debugging
+  deps.toLLMLog("[toLLM] ─── Reflect RemainingQuery ───");
+  deps.toLLMLog("[system]");
+  deps.toLLMLog(context);
+  deps.toLLMLog("[user]");
+  deps.toLLMLog(user);
 
   const result = await callLLM(
     deps.ollamaClient,
-    [{ role: "system", content: prompt }],
+    [
+      { role: "system", content: context },
+      { role: "user", content: user },
+    ],
     [],
-    { spinnerMessage: "Planning next step", silent: true }
+    { spinnerMessage: "Reflecting", silent: true }
   );
 
   return result.content.trim() || state.originalQuery;
@@ -235,30 +166,28 @@ async function getSummary(
   state: TurnWorkingState,
   deps: ReflectDeps
 ): Promise<string> {
-  const prompt = `${context}
-
-TASK: Summarize what THIS MISSION accomplished.
-
-CRITICAL CONTEXT:
-- STATUS shows the current game state (cumulative result of ALL past missions)
-- MISSION PROGRESS shows ONLY the tools called during THIS mission
-- Your summary must describe ONLY actions from MISSION PROGRESS, not game state
+  const user = `TASK: Summarize what THIS MISSION accomplished.
 
 RULES:
-1. ONLY describe tools listed in MISSION PROGRESS above
-2. If MISSION PROGRESS shows "(none yet)", say "No actions were taken"
-3. Do NOT infer actions from STATUS - that's historical context, not current work
-4. For informational tools (status, get_*): describe what info was retrieved
+- ONLY describe tools listed in MISSION PROGRESS
+- If MISSION PROGRESS shows "(none yet)", say "No actions were taken"
+- Do NOT infer actions from STATUS - that's historical context
 
-Reply with 1-2 sentences about THIS mission only.`;
+OUTPUT: 1-2 sentences about THIS mission only.`;
 
-  // Log the summary prompt for debugging
-  deps.toLLMLog("[toLLM] ─── Reflect Summary Prompt ───");
-  deps.toLLMLog(prompt);
+  // Log the prompts for debugging
+  deps.toLLMLog("[toLLM] ─── Reflect Summary ───");
+  deps.toLLMLog("[system]");
+  deps.toLLMLog(context);
+  deps.toLLMLog("[user]");
+  deps.toLLMLog(user);
 
   const result = await callLLM(
     deps.ollamaClient,
-    [{ role: "system", content: prompt }],
+    [
+      { role: "system", content: context },
+      { role: "user", content: user },
+    ],
     [],
     { spinnerMessage: "Summarizing", silent: true }
   );
@@ -266,50 +195,29 @@ Reply with 1-2 sentences about THIS mission only.`;
   return result.content.trim() || generateDefaultSummary(state);
 }
 
-async function getQuestion(
-  context: string,
-  state: TurnWorkingState,
-  deps: ReflectDeps
-): Promise<string> {
-  // Get most recent failure for focused questioning
-  const failures = state.groupToolResults.filter((e) => !e.success);
-  const lastFailure = failures.at(-1);
+// === Main Function ===
 
-  let taskPrompt: string;
-  if (lastFailure) {
-    // Focus on the specific error
-    taskPrompt = `TASK: The tool "${lastFailure.toolName}" failed with this error:
-${lastFailure.result}
+/**
+ * Parse the reflect output to determine action.
+ */
+function parseReflectOutput(output: string): { action: "done" | "ask" | "continue"; value: string } {
+  const trimmed = output.trim();
+  const upper = trimmed.toUpperCase();
 
-Ask the user ONE specific question about how to handle this error.
-- Focus on the error message and what options the user has
-- Do NOT ask about mission objectives or clarifications unrelated to the error
-- Be concise and actionable`;
-  } else {
-    taskPrompt = `TASK: What question should we ask the user?
-
-Reply with the question only.`;
+  // Check for DONE
+  if (upper === "DONE" || upper.startsWith("DONE.") || upper.startsWith("DONE:")) {
+    return { action: "done", value: "" };
   }
 
-  const prompt = `${context}
+  // Check for ASK: <question>
+  if (upper.startsWith("ASK:") || upper.startsWith("ASK ")) {
+    const question = trimmed.slice(4).trim();
+    return { action: "ask", value: question || "How would you like to proceed?" };
+  }
 
-${taskPrompt}`;
-
-  // Log the question prompt for debugging
-  deps.toLLMLog("[toLLM] ─── Reflect Question Prompt ───");
-  deps.toLLMLog(prompt);
-
-  const result = await callLLM(
-    deps.ollamaClient,
-    [{ role: "system", content: prompt }],
-    [],
-    { spinnerMessage: "Formulating question", silent: true }
-  );
-
-  return result.content.trim() || "How would you like to proceed?";
+  // Otherwise it's remaining work
+  return { action: "continue", value: trimmed };
 }
-
-// === Main Function ===
 
 export async function reflectAndSummarize(
   state: TurnWorkingState,
@@ -335,35 +243,31 @@ export async function reflectAndSummarize(
     state.cachedStatusInfo = statusInfo;
   }
 
-  // Build shared context
+  // Build shared context (system block)
   const context = buildContext(state, statusInfo, deps);
 
-  // Call 1: Get decision
-  const decision = await getDecision(context, deps);
-  deps.agentLog(`[reflect] Decision: ${decision}`);
+  // Single call: get remaining work (or DONE/ASK)
+  const output = await getRemainingQuery(context, state, deps);
+  const parsed = parseReflectOutput(output);
+  deps.agentLog(`[reflect] Output: "${output}" → ${parsed.action}`);
 
-  // Call 2: Get follow-up based on decision
-  if (decision === "continue") {
-    const remainingQuery = await getRemainingQuery(context, state, deps);
-    deps.agentLog(`[reflect] Remaining: ${remainingQuery}`);
-
-    // Validate: if remaining is empty/none, task is actually done
-    const lower = remainingQuery.toLowerCase().trim();
-    if (!remainingQuery.trim() || lower === "none" || lower === "nothing" || lower === "n/a") {
-      deps.agentLog(`[reflect] Empty remaining query, overriding to DONE`);
+  switch (parsed.action) {
+    case "done": {
       const summary = await getSummary(context, state, deps);
       return { action: "done", summary };
     }
-
-    return { action: "continue", remainingQuery };
+    case "ask": {
+      return { action: "ask", question: parsed.value };
+    }
+    case "continue": {
+      // Validate: if remaining is empty/none, task is actually done
+      const lower = parsed.value.toLowerCase();
+      if (!parsed.value || lower === "none" || lower === "nothing" || lower === "n/a") {
+        deps.agentLog(`[reflect] Empty remaining query, overriding to DONE`);
+        const summary = await getSummary(context, state, deps);
+        return { action: "done", summary };
+      }
+      return { action: "continue", remainingQuery: parsed.value };
+    }
   }
-
-  if (decision === "ask") {
-    const question = await getQuestion(context, state, deps);
-    return { action: "ask", question };
-  }
-
-  // decision === "done"
-  const summary = await getSummary(context, state, deps);
-  return { action: "done", summary };
 }

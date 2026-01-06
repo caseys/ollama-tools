@@ -93,19 +93,21 @@ PARAMETERS:
 ${parameterHints}` : ""}
 
 STATUS:
-${statusInfo || "No status available."}
+${statusInfo || "No status available."}`;
 
-YOUR ONLY JOB: Call "${tool.name}" with arguments from the query below.
+  const user = `TASK: Call "${tool.name}" with arguments from the mission query.
 
-CRITICAL: You MUST call "${tool.name}".  Or as a last resort:respond with clarifying question for user.
+MISSION: ${userQuery}
 
 RULES:
-1. Call ${tool.name} - extract arguments from the user query.
-2. Ignore parts of the user query that don't map to this tool's parameters. Later steps handle those.
-3. Only include arguments explicitly stated or clearly implied.
-4. Do not fabricate arguments. Prefer default/missing arguments over made-up ones.`;
+1. Extract arguments from the mission query
+2. Ignore parts that don't map to this tool's parameters - later steps handle those
+3. Only include arguments explicitly stated or clearly implied
+4. Prefer default/missing arguments over fabricated ones
 
-  return { system, user: userQuery };
+OUTPUT: Call "${tool.name}" or ask a clarifying question.`;
+
+  return { system, user };
 }
 
 // === Speech Helpers ===

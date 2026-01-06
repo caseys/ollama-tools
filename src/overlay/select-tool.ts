@@ -149,23 +149,23 @@ ${historySummary || "This is the first request."}
 ${previousContext}${toolErrorSection}
 ${lastFailureNote}
 
-ITERATION: ${iteration}/${maxIterations}
+ITERATION: ${iteration}/${maxIterations}`;
 
-TASK: Select the NEXT tool to work toward completing the user request.
+  const user = `TASK: Select the NEXT tool to complete the user request.
+
+REQUEST: ${remainingQuery}
 
 RULES:
 1. Select ONE tool that advances toward the goal
 2. Consider what has already been done in MISSION PROGRESS
 3. If the request is already satisfied or no tool applies, say "done"
 4. Do not repeat tools that already succeeded for the same purpose
-5. As last resort, get clarification from the user by asking a question
-6. If you are 100% sure we are done, reply with "done".
 
-OUTPUT: Reply with ONLY a tool name.`;
+OUTPUT: Reply with ONLY a tool name, or "done".`;
 
   return [
     { role: "system", content: system },
-    { role: "user", content: remainingQuery },
+    { role: "user", content: user },
   ];
 }
 
@@ -273,9 +273,10 @@ export async function selectTool(
     state.lastToolError
   );
 
-  deps.toLLMLog("[toLLM] ─── Select Tool Prompt ───");
+  deps.toLLMLog("[toLLM] ─── Select Tool ───");
+  deps.toLLMLog("[system]");
   deps.toLLMLog(messages[0]?.content ?? "");
-  deps.toLLMLog("\n[user]");
+  deps.toLLMLog("[user]");
   deps.toLLMLog(messages[1]?.content ?? "");
 
   // Run consensus with early exit - consensus varies sampling params
