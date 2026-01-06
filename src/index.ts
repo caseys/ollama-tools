@@ -76,6 +76,9 @@ async function main(): Promise<void> {
     agentWarn: loggers.agentWarn,
   });
 
+  // Create timestamped cache for status (expires after 60 seconds)
+  const startupStatusCache = { value: startupStatusInfo, timestamp: Date.now() };
+
   // roleForAssistant resolves in background while user reads greeting
   let agentPrompts: { roleForUser: string; roleForAssistant: string } | undefined;
   const getAgentPrompts = async (): Promise<{ roleForUser: string; roleForAssistant: string }> => {
@@ -158,7 +161,7 @@ async function main(): Promise<void> {
         loggers.agentWarn(`[agent] ask_user in single-prompt mode: "${question}" - returning empty`);
         return "";
       },
-      cachedStatus: startupStatusInfo,
+      cachedStatus: startupStatusCache,
     };
 
     const turnOutput = await runTurn(turnInput, machineDeps);
@@ -244,7 +247,7 @@ async function main(): Promise<void> {
       resultLog: loggers.resultLog,
       say: maybeSay,
       sayResult: maybeSayResult,
-      cachedStatus: startupStatusInfo,
+      cachedStatus: startupStatusCache,
       // Interactive mode: prompt user for clarification via voice or keyboard
       promptUser: async (question: string) => {
         spinner.stop();

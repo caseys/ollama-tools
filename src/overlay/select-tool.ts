@@ -125,6 +125,7 @@ function buildSelectToolPrompt(
   const previousContext = formatPreviousResults(previousResults);
 
   // Show last failure for context (but don't tell LLM to avoid - might need retry with different args)
+  // eslint-disable-next-line unicorn/prefer-array-find
   const lastFailure = previousResults.filter(e => !e.success).at(-1);
   const lastFailureNote = lastFailure
     ? `\n⚠️ LAST FAILURE: ${lastFailure.toolName} - may need different arguments if retrying`
@@ -242,10 +243,13 @@ export async function selectTool(
     return { tool: undefined, isDone: true, question: undefined, consensusCount: 0, queriesRun: 0 };
   }
 
-  // Use cached status or fetch fresh
+  // Use cached status or fetch fresh (cache expires after 60 seconds)
+  const STATUS_CACHE_TTL = 60_000;
   let statusInfo: string;
-  if (state.cachedStatusInfo !== undefined) {
-    statusInfo = state.cachedStatusInfo;
+  const now = Date.now();
+  if (state.cachedStatusInfo && (now - state.cachedStatusInfo.timestamp) < STATUS_CACHE_TTL) {
+    deps.agentLog("[select] Using cached status");
+    statusInfo = state.cachedStatusInfo.value;
   } else {
     deps.spinner.start("Reading status");
     const result = await fetchStatusInfo(
@@ -254,7 +258,7 @@ export async function selectTool(
       "Selecting "
     );
     statusInfo = result.statusInfo;
-    state.cachedStatusInfo = statusInfo;
+    state.cachedStatusInfo = { value: statusInfo, timestamp: now };
   }
 
   // Summarize history from previous sessions

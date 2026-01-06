@@ -114,6 +114,7 @@ async function getRemainingQuery(
   deps: ReflectDeps
 ): Promise<string> {
   // Include last successful tool result for advice extraction
+  // eslint-disable-next-line unicorn/prefer-array-find
   const lastSuccess = state.groupToolResults.filter(e => e.success).at(-1);
   const toolAdviceSection = lastSuccess
     ? `\nLAST TOOL OUTPUT (${lastSuccess.toolName}):\n${lastSuccess.result.slice(0, 500)}`
@@ -135,9 +136,10 @@ RULES:
 - A tool completing ✓ does NOT mean the goal is achieved
 - Check MISSION PROGRESS for suggested next steps from tool outputs
 - If multiple tools keep failing, ask the user for help
+- If no work is remaining and STATUS indicates all goals are satisfied, respond with "DONE"
 
 OUTPUT (one of):
-- DONE - if all goals in original request are satisfied per STATUS
+- DONE - if all goals in original request are satisfied
 - ASK: <question> - if you need user clarification
 - <remaining work> - what still needs to be done`;
 
@@ -227,11 +229,13 @@ export async function reflectAndSummarize(
   const failureCount = state.groupToolResults.filter((e) => !e.success).length;
   deps.agentLog(`[reflect] Iteration ${state.iteration}, ${state.groupToolResults.length} tool(s) completed, ${failureCount} failed`);
 
-  // Use cached status or fetch fresh (typically fresh after tool execution)
+  // Use cached status or fetch fresh (cache expires after 60 seconds)
+  const STATUS_CACHE_TTL = 60_000;
   let statusInfo: string;
-  if (state.cachedStatusInfo !== undefined) {
+  const now = Date.now();
+  if (state.cachedStatusInfo && (now - state.cachedStatusInfo.timestamp) < STATUS_CACHE_TTL) {
     deps.agentLog("[reflect] Using cached status");
-    statusInfo = state.cachedStatusInfo;
+    statusInfo = state.cachedStatusInfo.value;
   } else {
     deps.spinner.start("Reading status");
     const result = await fetchStatusInfo(
@@ -240,7 +244,7 @@ export async function reflectAndSummarize(
       "Reflecting "
     );
     statusInfo = result.statusInfo;
-    state.cachedStatusInfo = statusInfo;
+    state.cachedStatusInfo = { value: statusInfo, timestamp: now };
   }
 
   // Build shared context (system block)

@@ -72,8 +72,8 @@ export interface TurnWorkingState {
     queriesRun: number;
   };
 
-  // Cached status info (cleared after tool execution)
-  cachedStatusInfo?: string;
+  // Cached status info (cleared after tool execution, expires after 60s)
+  cachedStatusInfo?: { value: string; timestamp: number };
 }
 
 // === Output Types ===

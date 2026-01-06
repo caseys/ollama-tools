@@ -135,7 +135,6 @@ function buildSpokenResult(
 
   // For errors, build descriptive message
   const lines = result.split("\n").filter(l => l.trim());
-  const firstLine = lines[0] ?? "";
 
   // Find first meaningful error line (skip generic "ERROR" lines)
   let errorDetail = "";
@@ -207,16 +206,18 @@ export async function executeTool(
     deps.agentLog(`[execute] Retrying ${toolName} after failure`);
   }
 
-  // Use cached status or fetch fresh
+  // Use cached status or fetch fresh (cache expires after 60 seconds)
+  const STATUS_CACHE_TTL = 60_000;
   let statusInfo: string;
-  if (state.cachedStatusInfo !== undefined) {
+  const now = Date.now();
+  if (state.cachedStatusInfo && (now - state.cachedStatusInfo.timestamp) < STATUS_CACHE_TTL) {
     deps.agentLog("[execute] Using cached status");
-    statusInfo = state.cachedStatusInfo;
+    statusInfo = state.cachedStatusInfo.value;
   } else {
     deps.spinner.start("Reading status");
     const result = await fetchStatusInfo(deps.client, { agentLog: deps.agentLog, agentWarn: deps.agentWarn }, "Execute ");
     statusInfo = result.statusInfo;
-    state.cachedStatusInfo = statusInfo;
+    state.cachedStatusInfo = { value: statusInfo, timestamp: now };
   }
 
   const prompt = buildFocusedToolPrompt(

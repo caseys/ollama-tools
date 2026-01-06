@@ -53,7 +53,8 @@ export interface MachineDeps {
   // Prompts user for clarification when LLM can't extract tool arguments
   promptUser: (question: string) => Promise<string>;
   // Pre-fetched status from startup (avoids redundant MCP call on first turn)
-  cachedStatus?: string;
+  // Includes timestamp for 60-second expiry
+  cachedStatus?: { value: string; timestamp: number };
 }
 
 // === State Summary Builder ===
