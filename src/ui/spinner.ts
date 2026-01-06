@@ -20,7 +20,6 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
   let currentMessage = "";
 
   const terminalUI = deps?.terminalUI;
-  const useEnhanced = terminalUI?.isEnhancedMode() ?? false;
 
   function start(message: string): void {
     if (message !== currentMessage) {
@@ -31,7 +30,8 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
     stop();
     spinnerIndex = 0;
 
-    if (useEnhanced && terminalUI) {
+    if (terminalUI) {
+      // Use terminalUI's spinner (logs replaced messages in gray)
       terminalUI.startSpinner(message);
     } else {
       spinnerInterval = setInterval(() => {
@@ -42,7 +42,7 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
   }
 
   function stop(): void {
-    if (useEnhanced && terminalUI) {
+    if (terminalUI) {
       terminalUI.stopSpinner();
     } else if (spinnerInterval !== undefined) {
       clearInterval(spinnerInterval);
@@ -57,7 +57,7 @@ export function createSpinner(debugMode: boolean, agentLog: Logger, deps?: Spinn
       deps?.raiseHand?.(message);
     }
 
-    if (useEnhanced && terminalUI) {
+    if (terminalUI) {
       terminalUI.updateSpinner(message);
     } else if (spinnerInterval !== undefined) {
       const frame = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length];
